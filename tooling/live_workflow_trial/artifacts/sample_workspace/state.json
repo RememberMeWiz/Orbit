@@ -1,0 +1,23 @@
+{
+  "accepted_handoff_digests": {},
+  "accepted_handoff_ids": [],
+  "approval_records": {},
+  "approval_state": "IDLE",
+  "blocker_state": null,
+  "current_owner_role": "WORKER",
+  "current_stage": "WORKER",
+  "delivery_state": "IDLE",
+  "last_artifact_digest": null,
+  "last_handoff_id": null,
+  "last_sequence": 0,
+  "pending_approval": null,
+  "pending_delivery": null,
+  "project_id": "Orbit",
+  "schema_version": "orbit.workflow-state/0.1-draft",
+  "state_revision": 1,
+  "updated_at": "2026-08-18T16:53:19.545857+00:00",
+  "work_item": "M0-WF-WIN-001",
+  "work_state": "ASSIGNED",
+  "workflow_id": "yong-m0-windows-workflow",
+  "workflow_manifest_version": "orbit.workflow-contracts/0.1-draft"
+}
