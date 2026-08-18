@@ -1,0 +1,52 @@
+# Build and Artifacts
+build/
+bin/
+out/
+.gradle/
+*.class
+*.apk
+*.aab
+*.dex
+*.aar
+
+# IntelliJ IDEA / Android Studio
+.idea/
+*.iml
+*.iws
+*.ipr
+.navigation/
+captures/
+.externalNativeBuild/
+.cxx/
+local.properties
+
+# VS Code / Editors
+.vscode/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# OS / Temporary Files
+tmp/
+*.log
+*.tmp
+*.bak
+
+# Secrets and Local Credentials (STRICT)
+*.keystore
+*.jks
+*.p12
+*.pem
+*.key
+google-services.json
+secrets.properties
+*.local.json
+.env
+.env.*
+!*.env.example
+
+# Evaluation and Test Run Artifacts (keep definitions, ignore transient reports)
+evals/reports/*
+!evals/reports/.gitkeep

@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Orbit Git Pre-commit Hook (Sample)
+# Prevents accidental commits of secrets, API keys, or raw keystores.
+
+set -euo pipefail
+
+echo "Running Orbit pre-commit checks..."
+
+# Check 1: Secrets Scanning
+if git diff --cached | grep -nE "(AIza[0-9A-Za-z-_]{35}|sk-[a-zA-Z0-9]{48}|ghp_[a-zA-Z0-9]{36})"; then
+  echo "ERROR: Potential secret detected in commit! Rejecting commit."
+  exit 1
+fi
+
+# Check 2: Keystore and Private Key Files
+if git diff --cached --name-only | grep -E "\.(keystore|jks|p12|pem|key)$"; then
+  echo "ERROR: Attempting to commit cryptographic key or keystore file! Rejecting commit."
+  exit 1
+fi
+
+echo "Pre-commit checks passed."
