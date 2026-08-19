@@ -97,6 +97,15 @@ New-Item -ItemType Directory -Force -Path $tempRoot | Out-Null
 try {
   Copy-Item -Recurse -Force $ArtifactRoot (Join-Path $tempRoot "artifacts")
   $workspace = Join-Path $tempRoot "artifacts\sample_workspace"
+
+  # Git does not track empty directories, so a clean repository checkout has no
+  # inbox/receipts/outboxes even though a delivered package does. Create the
+  # workspace skeleton the smoke needs so this step behaves identically whether
+  # it runs from a checkout or from an unpacked handoff package.
+  foreach ($relative in @("inbox", "receipts", "outboxes\WORKER", "outboxes\TL", "outboxes\QA", "outboxes\PM", "escalation", "decisions")) {
+    New-Item -ItemType Directory -Force -Path (Join-Path $workspace $relative) | Out-Null
+  }
+
   Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $workspace "state.json")
   Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $workspace "receipts\receipts.jsonl")
   Get-ChildItem -File -ErrorAction SilentlyContinue (Join-Path $workspace "inbox") | Remove-Item -Force
