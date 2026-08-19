@@ -28,6 +28,13 @@ local.properties
 Thumbs.db
 desktop.ini
 
+# Python build artifacts
+__pycache__/
+*.py[cod]
+
+# Regenerated native validation evidence (delivered via handoff packages)
+tooling/live_workflow_trial/artifacts/evidence/
+
 # OS / Temporary Files
 tmp/
 *.log
