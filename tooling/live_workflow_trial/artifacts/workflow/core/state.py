@@ -14,13 +14,15 @@ class StateStore:
 
     def initial(self) -> Dict[str, Any]:
         stages = self.manifest["stages"]
+        initial_stage = self.manifest.get("initial_stage", stages[0])
+        initial_owner = self.manifest.get("initial_owner_role", initial_stage)
         return {
             "workflow_id": self.manifest["workflow_id"],
             "project_id": self.manifest["project_id"],
             "workflow_manifest_version": self.manifest.get("schema_version", "orbit.workflow-contracts/0.1-draft"),
             "work_item": self.manifest["work_item"],
-            "current_owner_role": stages[0],
-            "current_stage": stages[0],
+            "current_owner_role": initial_owner,
+            "current_stage": initial_stage,
             "work_state": "ASSIGNED",
             "delivery_state": "IDLE",
             "approval_state": "IDLE",
@@ -46,6 +48,11 @@ class StateStore:
             self.save(state)
             return state
         state = json.loads(self.path.read_text(encoding="utf-8"))
+        for identity_key in ("project_id", "workflow_id", "work_item"):
+            existing = state.get(identity_key)
+            expected = self.manifest.get(identity_key)
+            if existing is not None and existing != expected:
+                raise ValueError(f"state-{identity_key}-mismatch")
         defaults = self.initial()
         changed = False
         for key, value in defaults.items():

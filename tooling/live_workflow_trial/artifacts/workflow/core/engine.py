@@ -10,6 +10,7 @@ from typing import Any, Dict, Optional, Protocol, Tuple
 from workflow.contracts import ValidationResult
 from .state import StateStore
 from .storage import utc_now_iso
+from .runtime import resolve_runtime_paths
 from .validation import HandoffValidator
 
 
@@ -23,12 +24,11 @@ class WorkflowEngine:
     def __init__(self, root: Path, manifest: Dict[str, Any], executor: PacketExecutor):
         self.root = root
         self.manifest = manifest
-        workspace = root / "artifacts" / "sample_workspace"
-        self.store = StateStore(workspace / "state.json", manifest)
-        self.receipt_path = workspace / "receipts" / "receipts.jsonl"
+        self.runtime_paths = resolve_runtime_paths(root, manifest)
+        self.store = StateStore(self.runtime_paths.state, manifest)
+        self.receipt_path = self.runtime_paths.receipts
         self.executor = executor
-        approved_inbox = root / "artifacts" / manifest["inbox"]
-        self.validator = HandoffValidator(manifest, approved_inbox)
+        self.validator = HandoffValidator(manifest, self.runtime_paths.inbox)
 
     def _receipt(self, record: Dict[str, Any]) -> None:
         old_state = record.get("old_state") or {}

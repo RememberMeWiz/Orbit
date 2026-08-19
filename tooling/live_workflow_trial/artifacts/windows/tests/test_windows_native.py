@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import subprocess
 import tempfile
 import unittest
 import zipfile
@@ -13,8 +14,10 @@ try:
 except ImportError:  # pragma: no cover - native suite is skipped off Windows
     _winapi = None
 
+from workflow.core.bootstrap import BootstrapError, bootstrap_workspace
 from workflow.core.engine import WorkflowEngine
 from workflow.core.manifest import load_manifest
+from workflow.core.runtime import RuntimeConfigurationError
 from workflow.core.storage import file_digest
 from windows.adapters.place_packet import PlacePacketExecutor
 from windows.observation.reconciler import WorkspaceReconciler
@@ -269,16 +272,26 @@ class NativeWindowsGateTests(unittest.TestCase):
             "unc": "\\\\server\\share\\orbit-outside",
             "drive_root": "C:\\",
         }
+        invalid_config_results = {}
         for label, endpoint in bad_values.items():
             def mutate(manifest, endpoint=endpoint):
                 manifest["destinations"]["TL"] = endpoint
                 manifest["role_destination_registry"]["TL"]["endpoint_ref"] = endpoint
-            rt = self.fresh_runtime(f"path-{label}", mutate)
-            ok, fail_result, destination = rt["executor"].place_packet("TL", {"handoff_id": f"path-{label}", "artifact_digest": "1" * 64, "to": "TL"})
-            self.assertFalse(ok)
-            self.assertEqual(destination, "none")
-            self.assertTrue(fail_result.startswith("FAILED_FINAL:"))
-            decisions[label] = rt["executor"].last_path_decision
+
+            invalid_root = Path(self.tmp.name) / f"path-{label}"
+            with self.assertRaises(RuntimeConfigurationError) as raised:
+                self.fresh_runtime(f"path-{label}", mutate)
+
+            # LIVE-002 resolves and validates trusted runtime paths during
+            # WorkflowEngine initialization. Invalid destination configuration
+            # must fail before any PLACE_PACKET call or packet write occurs.
+            packet_writes = list(invalid_root.rglob("NEXT_*.json")) if invalid_root.exists() else []
+            self.assertEqual(packet_writes, [])
+            invalid_config_results[label] = {
+                "exception_type": type(raised.exception).__name__,
+                "exception": str(raised.exception),
+                "packet_write_count": len(packet_writes),
+            }
 
         # Windows separator/case alias remains inside the configured root.
         def alias_mutate(manifest):
@@ -318,6 +331,8 @@ class NativeWindowsGateTests(unittest.TestCase):
 
         write_gate_evidence("NWIN-005", {
             "status": "PASS",
+            "invalid_destination_configuration": invalid_config_results,
+            "invalid_configuration_fails_before_packet_placement": True,
             "reparse_fixture": "directory-junction",
             "symbolic_link_privilege_required": False,
             "windows_path_decisions": decisions,
@@ -567,6 +582,176 @@ class NativeWindowsGateTests(unittest.TestCase):
             "diagnostic_receipt_id": receipts[-1]["receipt_id"],
             "raw_sensitive_input_in_delivery_packet": False,
             "bounded_trace_sinks": [str(path) for path in sinks],
+        })
+
+
+    def test_LIVE003_NATIVE_001_bootstrap_junction_escape_has_zero_outside_writes(self):
+        root = Path(self.tmp.name) / "live003-bootstrap-junction"
+        shutil.copytree(self.source_root / "artifacts", root / "artifacts")
+        config_path = root / "artifacts/live003_bootstrap_config.json"
+        manifest = json.loads(config_path.read_text(encoding="utf-8"))
+        approved = root / "artifacts/live_trial"
+        approved.mkdir(parents=True, exist_ok=True)
+        outside = Path(self.tmp.name) / "live003-bootstrap-outside"
+        outside.mkdir(parents=True, exist_ok=True)
+        workspace = approved / "M0-WF-LIVE-003"
+        self.assertIsNotNone(_winapi, "LIVE003 native bootstrap fixture requires CPython junction helper")
+        try:
+            _winapi.CreateJunction(str(outside), str(workspace))
+            self.assertTrue(workspace.is_junction())
+            with self.assertRaises(BootstrapError) as raised:
+                bootstrap_workspace(
+                    root,
+                    manifest,
+                    project_id="Orbit",
+                    workflow_id="orbit-m0-live-trial",
+                    work_item="M0-WF-LIVE-003",
+                )
+            self.assertEqual(list(outside.rglob("*")), [])
+            write_gate_evidence("LIVE003-NWIN-001", {
+                "status": "PASS",
+                "fixture": "directory-junction",
+                "exception_type": type(raised.exception).__name__,
+                "reason": str(raised.exception),
+                "outside_write_count": 0,
+                "accepted_state_created": False,
+            })
+        finally:
+            if workspace.exists() or workspace.is_junction():
+                workspace.rmdir()
+
+
+    def test_LIVE003_NATIVE_002_bootstrap_powershell_launcher_relative_paths_and_idempotency(self):
+        root = Path(self.tmp.name) / "live003-bootstrap-launcher"
+        shutil.copytree(self.source_root / "artifacts", root / "artifacts")
+
+        workspace = root / "artifacts/live_trial/M0-WF-LIVE-003"
+        if workspace.exists():
+            shutil.rmtree(workspace)
+
+        system_root = Path(os.environ.get("SystemRoot", r"C:\\Windows"))
+        powershell = system_root / "System32/WindowsPowerShell/v1.0/powershell.exe"
+        self.assertTrue(powershell.is_file(), f"Windows PowerShell 5.1 executable not found: {powershell}")
+
+        version = subprocess.run(
+            [str(powershell), "-NoProfile", "-NonInteractive", "-Command", "$PSVersionTable.PSVersion.ToString()"],
+            cwd=root,
+            text=True,
+            capture_output=True,
+            check=True,
+        ).stdout.strip()
+        self.assertTrue(version.startswith("5.1"), f"Expected Windows PowerShell 5.1, got {version!r}")
+
+        launcher = root / "artifacts/windows/run_bootstrap.ps1"
+        launcher_text = launcher.read_text(encoding="utf-8")
+        lowered_launcher = launcher_text.lower()
+        self.assertNotIn("runas", lowered_launcher)
+        self.assertNotIn("start-process", lowered_launcher)
+        self.assertNotIn("-itemtype symboliclink", lowered_launcher)
+
+        command = [
+            str(powershell),
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            r".\artifacts\windows\run_bootstrap.ps1",
+            "-Root",
+            ".",
+            "-Config",
+            r".\artifacts\live003_bootstrap_config.json",
+            "-ProjectId",
+            "Orbit",
+            "-WorkflowId",
+            "orbit-m0-live-trial",
+            "-WorkItem",
+            "M0-WF-LIVE-003",
+        ]
+
+        first = subprocess.run(command, cwd=root, text=True, capture_output=True)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        first_lines = [line for line in first.stdout.splitlines() if line.strip()]
+        self.assertTrue(first_lines, "Bootstrap launcher produced no JSON output")
+        first_result = json.loads(first_lines[-1])
+        self.assertEqual(first_result["status"], "INITIALIZED")
+        self.assertEqual(first_result["project_id"], "Orbit")
+        self.assertEqual(first_result["workflow_id"], "orbit-m0-live-trial")
+        self.assertEqual(first_result["work_item"], "M0-WF-LIVE-003")
+        self.assertEqual(Path(first_result["workspace"]).resolve(), workspace.resolve())
+        self.assertNotIn("sample_workspace", str(first_result["workspace"]))
+        self.assertEqual(first_result["state_revision"], 1)
+        self.assertEqual(first_result["executor_catalog"], ["PLACE_PACKET"])
+
+        state_path = workspace / "state.json"
+        manifest_path = workspace / "manifest.json"
+        receipts_path = workspace / "receipts/receipts.jsonl"
+        self.assertTrue(state_path.is_file())
+        self.assertTrue(manifest_path.is_file())
+        self.assertTrue(receipts_path.is_file())
+
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        generated_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            (state["project_id"], state["workflow_id"], state["work_item"]),
+            ("Orbit", "orbit-m0-live-trial", "M0-WF-LIVE-003"),
+        )
+        self.assertEqual(
+            (generated_manifest["project_id"], generated_manifest["workflow_id"], generated_manifest["work_item"]),
+            ("Orbit", "orbit-m0-live-trial", "M0-WF-LIVE-003"),
+        )
+        self.assertEqual(state["state_revision"], 1)
+        self.assertEqual(generated_manifest["allowed_executor_operations"], ["PLACE_PACKET"])
+
+        before_files = sorted(str(p.relative_to(workspace)) for p in workspace.rglob("*") if p.is_file())
+        before_hashes = {
+            "state": file_digest(state_path),
+            "manifest": file_digest(manifest_path),
+            "receipts": file_digest(receipts_path),
+        }
+
+        second = subprocess.run(command, cwd=root, text=True, capture_output=True)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        second_lines = [line for line in second.stdout.splitlines() if line.strip()]
+        self.assertTrue(second_lines, "Repeat bootstrap launcher produced no JSON output")
+        second_result = json.loads(second_lines[-1])
+        self.assertEqual(second_result["status"], "ALREADY_INITIALIZED")
+        self.assertEqual(second_result["state_revision"], 1)
+        self.assertEqual(second_result["executor_catalog"], ["PLACE_PACKET"])
+
+        after_files = sorted(str(p.relative_to(workspace)) for p in workspace.rglob("*") if p.is_file())
+        after_hashes = {
+            "state": file_digest(state_path),
+            "manifest": file_digest(manifest_path),
+            "receipts": file_digest(receipts_path),
+        }
+        self.assertEqual(after_files, before_files)
+        self.assertEqual(after_hashes, before_hashes)
+
+        write_gate_evidence("LIVE003-NWIN-002", {
+            "status": "PASS",
+            "powershell_version": version,
+            "launcher": str(launcher),
+            "caller_cwd": str(root),
+            "root_argument": ".",
+            "config_argument": r".\artifacts\live003_bootstrap_config.json",
+            "first_status": first_result["status"],
+            "second_status": second_result["status"],
+            "resolved_identity": {
+                "project_id": state["project_id"],
+                "workflow_id": state["workflow_id"],
+                "work_item": state["work_item"],
+            },
+            "workspace": str(workspace),
+            "non_fixture_workspace": "sample_workspace" not in str(workspace),
+            "state_revision_first": first_result["state_revision"],
+            "state_revision_second": second_result["state_revision"],
+            "executor_catalog": first_result["executor_catalog"],
+            "authority_file_inventory_unchanged": before_files == after_files,
+            "authority_hashes_unchanged": before_hashes == after_hashes,
+            "receipts_sha256": after_hashes["receipts"],
+            "elevation_requested": False,
+            "developer_mode_dependency": False,
         })
 
 

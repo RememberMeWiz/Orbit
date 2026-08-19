@@ -4,6 +4,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
+from workflow.core.runtime import resolve_runtime_paths
 from workflow.core.validation import NAME_RE
 
 
@@ -62,10 +63,19 @@ class WorkspaceReconciler:
         self.root = root
         self.manifest = manifest
         self.engine = engine
-        self.inbox = root / "artifacts" / manifest["inbox"]
+        self.runtime_paths = resolve_runtime_paths(root, manifest)
+        self.inbox = self.runtime_paths.inbox
+        self.stop_path = self.runtime_paths.stop
         self.tracker = StableArtifactTracker(float(manifest["stable_window_seconds"]))
 
+    def is_stopped(self) -> bool:
+        return self.stop_path.is_file()
+
     def scan_once(self, now: Optional[float] = None):
+        # STOP is a configuration-owned control inside the selected workspace.
+        # Presence freezes automatic advancement, including after process restart.
+        if self.is_stopped():
+            return []
         self.inbox.mkdir(parents=True, exist_ok=True)
         results = []
         for path in sorted(self.inbox.iterdir()):

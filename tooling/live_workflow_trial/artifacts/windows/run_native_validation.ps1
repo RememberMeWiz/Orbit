@@ -55,8 +55,8 @@ try {
 if (Select-String -Path $testLog -Pattern "skipped .*native Windows gate" -Quiet) {
   throw "Native gate tests were skipped; this is not valid native Windows evidence."
 }
-if (-not (Select-String -Path $testLog -Pattern "Ran 11 tests" -Quiet)) {
-  throw "Expected the 11-test native gate suite to execute."
+if (-not (Select-String -Path $testLog -Pattern "Ran 13 tests" -Quiet)) {
+  throw "Expected the 13-test native gate suite to execute."
 }
 
 $gateFiles = @()
@@ -68,6 +68,16 @@ for ($i = 1; $i -le 11; $i++) {
   if ($gate.status -ne "PASS") { throw "Native gate did not report PASS: $gateId" }
   $gateFiles += (Split-Path -Leaf $gatePath)
 }
+$bootstrapGatePath = Join-Path $EvidenceDirectory "LIVE003-NWIN-001.json"
+if (-not (Test-Path $bootstrapGatePath)) { throw "Missing native evidence file: LIVE003-NWIN-001" }
+$bootstrapGate = Get-Content -Raw $bootstrapGatePath | ConvertFrom-Json
+if ($bootstrapGate.status -ne "PASS") { throw "Native bootstrap gate did not report PASS: LIVE003-NWIN-001" }
+$gateFiles += (Split-Path -Leaf $bootstrapGatePath)
+$bootstrapLauncherGatePath = Join-Path $EvidenceDirectory "LIVE003-NWIN-002.json"
+if (-not (Test-Path $bootstrapLauncherGatePath)) { throw "Missing native evidence file: LIVE003-NWIN-002" }
+$bootstrapLauncherGate = Get-Content -Raw $bootstrapLauncherGatePath | ConvertFrom-Json
+if ($bootstrapLauncherGate.status -ne "PASS") { throw "Native bootstrap launcher gate did not report PASS: LIVE003-NWIN-002" }
+$gateFiles += (Split-Path -Leaf $bootstrapLauncherGatePath)
 
 # Independent PowerShell-to-reconciler smoke proving the launcher and disposable
 # workspace path outside unittest. This remains a test harness action, not an
@@ -132,7 +142,7 @@ $postrunScan = Get-Content -Raw (Join-Path $EvidenceDirectory "postrun_secret_sc
 $traceScan = Get-Content -Raw (Join-Path $EvidenceDirectory "NWIN-011.json") | ConvertFrom-Json
 $summary = [ordered]@{
   status = "PASS"
-  native_windows_gate_tests = 11
+  native_windows_gate_tests = 13
   native_gate_files = $gateFiles
   reconciler_smoke = "PASS"
   allowed_executor_operations = @($manifest.allowed_executor_operations)

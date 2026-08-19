@@ -1,0 +1,47 @@
+{
+  "project_id": "Orbit",
+  "workflow_id": "orbit-m0-live-trial",
+  "work_item": "M0-WF-LIVE-003",
+  "work_item_title": "Real Work Item Bootstrapper",
+  "schema_version": "orbit.workflow-contracts/0.1-draft",
+  "stages": ["WORKER", "TL", "QA", "PM"],
+  "roles": ["WORKER", "TL", "QA", "PM"],
+  "initial_stage": "WORKER",
+  "initial_owner_role": "WORKER",
+  "valid_transitions": {
+    "WORKER": "TL",
+    "TL": "QA",
+    "QA": "PM"
+  },
+  "handoff_envelope": {
+    "required_header_fields": ["Work Item", "From", "To", "Status", "Handoff ID", "Sequence"],
+    "replay_identity_field": "Handoff ID",
+    "ordering_field": "Sequence",
+    "artifact_digest_field": "artifact_digest",
+    "artifact_digest_algorithm": "SHA-256",
+    "filesystem_timestamps_authoritative": false
+  },
+  "approved_trial_root": "live_trial",
+  "workspace": "live_trial/M0-WF-LIVE-003",
+  "inbox": "live_trial/M0-WF-LIVE-003/inbox",
+  "destinations": {
+    "WORKER": "live_trial/M0-WF-LIVE-003/outboxes/WORKER",
+    "TL": "live_trial/M0-WF-LIVE-003/outboxes/TL",
+    "QA": "live_trial/M0-WF-LIVE-003/outboxes/QA",
+    "PM": "live_trial/M0-WF-LIVE-003/outboxes/PM",
+    "BLOCKER": "live_trial/M0-WF-LIVE-003/escalation",
+    "DECISION": "live_trial/M0-WF-LIVE-003/decisions"
+  },
+  "approval_required_transitions": ["QA->PM"],
+  "approval_record_required_fields": ["approval_id", "workflow_id", "work_item", "transition", "handoff_id", "artifact_digest"],
+  "stable_window_seconds": 0.25,
+  "allowed_executor_operations": ["PLACE_PACKET"],
+  "role_destination_registry": {
+    "WORKER": {"role_id": "WORKER", "destination_id": "WORKER", "adapter_type": "PLACE_PACKET", "endpoint_ref": "live_trial/M0-WF-LIVE-003/outboxes/WORKER", "enabled": true},
+    "TL": {"role_id": "TL", "destination_id": "TL", "adapter_type": "PLACE_PACKET", "endpoint_ref": "live_trial/M0-WF-LIVE-003/outboxes/TL", "enabled": true},
+    "QA": {"role_id": "QA", "destination_id": "QA", "adapter_type": "PLACE_PACKET", "endpoint_ref": "live_trial/M0-WF-LIVE-003/outboxes/QA", "enabled": true},
+    "PM": {"role_id": "PM", "destination_id": "PM", "adapter_type": "PLACE_PACKET", "endpoint_ref": "live_trial/M0-WF-LIVE-003/outboxes/PM", "enabled": true},
+    "BLOCKER": {"role_id": "BLOCKER", "destination_id": "BLOCKER", "adapter_type": "PLACE_PACKET", "endpoint_ref": "live_trial/M0-WF-LIVE-003/escalation", "enabled": true},
+    "DECISION": {"role_id": "DECISION", "destination_id": "DECISION", "adapter_type": "PLACE_PACKET", "endpoint_ref": "live_trial/M0-WF-LIVE-003/decisions", "enabled": true}
+  }
+}
