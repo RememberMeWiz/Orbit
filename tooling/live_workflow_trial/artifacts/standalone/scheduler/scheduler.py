@@ -239,8 +239,19 @@ class LocalScheduler:
             # The engine accepted the artifact. Only now may the task complete.
             self.runtime.mark_complete(task, evidence={"handoff_id": handoff_id, "receipt_ids": [r.get("receipt_id") for r in accepted]})
 
+        # An accepted artifact is not necessarily an advanced work item: a gated
+        # transition is held at APPROVAL_PENDING with the owner unchanged.
+        # Reporting that as ADVANCED would overstate what happened.
+        held = [r for r in accepted if r.get("result") == "APPROVAL_PENDING"]
+        if held:
+            action = "AWAITING_APPROVAL"
+        elif accepted:
+            action = "ADVANCED"
+        else:
+            action = "EMITTED"
+
         return {
-            "action": "ADVANCED" if accepted else "EMITTED",
+            "action": action,
             "owner": owner,
             "recipient": recipient,
             "task_id": task.task_id,
