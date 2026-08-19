@@ -23,6 +23,8 @@ from .pm_envelope import (
     parse_envelope,
     request_identity,
 )
+from .chatgpt import ChatGptAdapter, ResponseObservation
+from .uia import UiaDriver, UiaResult
 from .registry import ChatEndpointRegistry, KNOWN_ROLE_SLUGS, fold_title
 from .teaching import TeachingTrace, TeachingTraceStore, condition_digest
 
@@ -33,4 +35,5 @@ __all__ = [
     "FeasibilityReport", "PMBridgeState", "PMDirective", "PMRequest",
     "TeachingTrace", "TeachingTraceStore", "assess", "condition_digest",
     "fold_title", "parse_envelope", "probe_uia", "request_identity", "run_diagnostic",
+    "ResponseObservation", "UiaDriver", "UiaResult",
 ]

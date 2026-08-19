@@ -27,6 +27,7 @@ DRIVER_OPERATIONS = (
     "read_composer",
     "list_artifacts",
     "response_state",
+    "press_send",
 )
 
 
@@ -112,3 +113,6 @@ class UiaDriver:
 
     def response_state(self) -> UiaResult:
         return self.call("response_state")
+
+    def press_send(self) -> UiaResult:
+        return self.call("press_send")

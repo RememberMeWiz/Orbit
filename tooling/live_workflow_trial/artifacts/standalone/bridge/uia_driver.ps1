@@ -53,6 +53,10 @@ function CT($e) {
   try { return $e.Current.ControlType.ProgrammaticName -replace "ControlType\.", "" } catch { return "" }
 }
 function NM($e) { try { return ($e.Current.Name -replace "\s+", " ").Trim() } catch { return "" } }
+# NOTE: composer ClassName is matched by substring, not equality. ProseMirror
+# appends state classes ("ProseMirror ProseMirror-focused") once the editor
+# has keyboard focus, so exact equality breaks the moment Orbit focuses it.
+#
 # NOTE: do not name this CLS -- that is a built-in alias for Clear-Host, and
 # PowerShell resolves aliases before functions, so the call silently returns
 # $null and every ClassName comparison quietly fails.
@@ -98,7 +102,7 @@ switch ($Operation) {
     foreach ($e in $all) {
       $t = CT $e; $n = NM $e; $c = ClassOf $e
       if ($counts.ContainsKey($t)) { $counts[$t]++ } else { $counts[$t] = 1 }
-      if ($t -eq "Edit" -and $c -eq "ProseMirror") { $composer = $n }
+      if ($t -eq "Edit" -and $c -like "*ProseMirror*") { $composer = $n }
       if ($t -eq "Button" -and $n -ceq "Send") { $send = $n }
       if ($t -eq "Button" -and $n -ceq "Add files and more") { $attach = $n }
       if ($t -eq "Document") { $doc = $n }
@@ -193,7 +197,7 @@ switch ($Operation) {
     if (-not $text) { Fail "message-empty" }
     $composer = $null
     foreach ($e in (All-Descendants $w)) {
-      if ((CT $e) -eq "Edit" -and (ClassOf $e) -eq "ProseMirror") { $composer = $e; break }
+      if ((CT $e) -eq "Edit" -and (ClassOf $e) -like "*ProseMirror*") { $composer = $e; break }
     }
     if ($null -eq $composer) { Fail "composer-not-found" }
     try {
@@ -212,7 +216,7 @@ switch ($Operation) {
   "read_composer" {
     $w = Get-ChatWindow
     foreach ($e in (All-Descendants $w)) {
-      if ((CT $e) -eq "Edit" -and (ClassOf $e) -eq "ProseMirror") {
+      if ((CT $e) -eq "Edit" -and (ClassOf $e) -like "*ProseMirror*") {
         Done @{ name = (NM $e) }
       }
     }
@@ -244,6 +248,30 @@ switch ($Operation) {
     }
     $state = if ($hasStop) { "streaming" } elseif ($hasSend) { "idle" } else { "unknown" }
     Done @{ state = $state; send_present = $hasSend; stop_present = $hasStop; stop_names = $names }
+  }
+
+  # The only operation that actually transmits. Requires exactly one enabled
+  # Send button, and refuses while a response is streaming.
+  "press_send" {
+    $w = Get-ChatWindow
+    $sends = @()
+    foreach ($e in (All-Descendants $w)) {
+      if ((CT $e) -eq "Button" -and (NM $e) -ceq "Send") { $sends += $e }
+    }
+    if ($sends.Count -eq 0) { Fail "send-control-not-found" }
+    if ($sends.Count -gt 1) { Fail "send-control-ambiguous" "$($sends.Count) Send buttons" }
+    $send = $sends[0]
+    if (-not $send.Current.IsEnabled) { Fail "send-control-disabled" }
+
+    foreach ($e in (All-Descendants $w)) {
+      if ((CT $e) -eq "Button" -and (NM $e) -match "(?i)^(stop|stop generating|stop streaming)$") {
+        Fail "response-in-progress"
+      }
+    }
+
+    if (-not (Invoke-Element $send)) { Fail "send-not-invokable" }
+    Start-Sleep -Milliseconds 700
+    Done @{ sent = $true }
   }
 
   default { Fail "operation-not-supported" $Operation }
