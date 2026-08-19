@@ -6,6 +6,7 @@ from .contracts import (
     LocalBrainResult,
     validate_result,
 )
+from .llama_cpp import LlamaCppBrain, from_config as llama_cpp_from_config
 from .providers import BrainProvider, BrainRouter, DeterministicBrain, LocalModelBrain
 
 __all__ = [
@@ -15,7 +16,9 @@ __all__ = [
     "BrainRouter",
     "DeterministicBrain",
     "LocalBrainRequest",
+    "LlamaCppBrain",
     "LocalBrainResult",
     "LocalModelBrain",
+    "llama_cpp_from_config",
     "validate_result",
 ]
