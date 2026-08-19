@@ -140,6 +140,44 @@ class LlamaCppBrainTests(unittest.TestCase):
         self.brain(capture, gpu_layers=20).reason(self.request)
         self.assertEqual(captured["argv"][captured["argv"].index("-ngl") + 1], "20")
 
+    def test_LLAMA_013_stdin_is_closed(self):
+        """llama-cli enters an interactive prompt loop when stdin stays open.
+
+        It then never returns, holds gigabytes, and only dies on timeout. This
+        cost a full misdiagnosis ("the model is slow") before the real cause was
+        found, so the fix is pinned here.
+        """
+        captured = {}
+
+        def capture(argv, **kw):
+            captured.update(kw)
+            return completed(answer({"status": "OK", "summary": "s"}))
+
+        self.brain(capture).reason(self.request)
+        self.assertEqual(captured.get("stdin"), subprocess.DEVNULL)
+
+    def test_LLAMA_014_single_turn_flags_present(self):
+        captured = {}
+
+        def capture(argv, **kw):
+            captured["argv"] = argv
+            return completed(answer({"status": "OK", "summary": "s"}))
+
+        self.brain(capture).reason(self.request)
+        self.assertIn("-no-cnv", captured["argv"])
+        self.assertIn("-st", captured["argv"])
+
+    def test_LLAMA_015_timeout_is_always_bounded(self):
+        """No invocation may run unbounded on the operator's machine."""
+        captured = {}
+
+        def capture(argv, **kw):
+            captured.update(kw)
+            return completed(answer({"status": "OK", "summary": "s"}))
+
+        self.brain(capture, timeout_seconds=42.0).reason(self.request)
+        self.assertEqual(captured.get("timeout"), 42.0)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

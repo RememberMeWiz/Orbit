@@ -110,6 +110,7 @@ class LlamaCppBrain:
             "--temp", "0.2",
             "--no-warmup",
             "-no-cnv",
+            "-st",
             "--simple-io",
         ]
         if self.gpu_layers > 0:
@@ -137,6 +138,11 @@ class LlamaCppBrain:
                 text=True,
                 capture_output=True,
                 timeout=self.timeout_seconds,
+                # llama-cli drops into an interactive prompt loop when stdin is a
+                # live handle, and then never returns. Closing stdin makes it
+                # read EOF and exit after generating. Without this the process
+                # spins, holds gigabytes, and only dies on timeout.
+                stdin=subprocess.DEVNULL,
             )
         except subprocess.TimeoutExpired:
             return LocalBrainResult(
