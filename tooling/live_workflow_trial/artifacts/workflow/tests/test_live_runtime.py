@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import shutil
 import tempfile
@@ -46,6 +47,19 @@ class LiveRuntimeTests(unittest.TestCase):
 
     def tearDown(self):
         self.tmp.cleanup()
+
+    @staticmethod
+    def snapshot_tree(root: Path) -> dict:
+        """Map every file under root to its SHA-256, for exact non-leakage checks."""
+        if not root.exists():
+            return {}
+        snapshot = {}
+        for path in sorted(root.rglob("*")):
+            if path.is_file():
+                snapshot[str(path.relative_to(root))] = hashlib.sha256(
+                    path.read_bytes()
+                ).hexdigest()
+        return snapshot
 
     def make_handoff(self, *, handoff_id: str = "live-001", sequence: int = 1, body: str = "Live runtime test.") -> Path:
         p = self.paths.inbox / "HANDOFF_M0-WF-LIVE-002_WORKER_TO_TL.md"
@@ -131,6 +145,13 @@ class LiveRuntimeTests(unittest.TestCase):
         self.assertTrue(p.exists())
 
     def test_LIVE_007_state_receipts_and_packet_remain_in_selected_workspace(self):
+        # The fixture workspace may or may not already carry persisted state: the
+        # package ships it empty, but the repository has a committed LIVE-001
+        # sample_workspace/state.json. Snapshot it and assert it is untouched,
+        # which proves non-leakage without assuming the file is absent.
+        fixture_workspace = self.root / "artifacts/sample_workspace"
+        before = self.snapshot_tree(fixture_workspace)
+
         p = self.make_handoff(handoff_id="live-paths")
         engine = self.engine()
         result = engine.process(p)
@@ -141,7 +162,12 @@ class LiveRuntimeTests(unittest.TestCase):
         packets = list(outbox.glob("NEXT_*.json"))
         self.assertEqual(len(packets), 1)
         self.assertTrue(str(packets[0].resolve()).startswith(str(self.paths.workspace)))
-        self.assertFalse((self.root / "artifacts/sample_workspace/state.json").exists())
+
+        self.assertEqual(
+            self.snapshot_tree(fixture_workspace),
+            before,
+            "live runtime wrote into the fixture sample_workspace",
+        )
 
     def test_LIVE_008_handoff_commands_cannot_expand_executor_authority(self):
         p = self.make_handoff(
