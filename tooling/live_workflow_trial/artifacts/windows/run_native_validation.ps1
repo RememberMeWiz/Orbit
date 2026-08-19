@@ -2,6 +2,8 @@ param(
   [string]$EvidenceDirectory = ""
 )
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot "python_launcher.ps1")
+
 $ArtifactRoot = Split-Path -Parent $PSScriptRoot
 $PackageRoot = Split-Path -Parent $ArtifactRoot
 if ([string]::IsNullOrWhiteSpace($EvidenceDirectory)) {
@@ -18,7 +20,9 @@ $contentManifestPath = Join-Path $ArtifactRoot "evidence\content_sha256.txt"
 $contentManifestHash = if (Test-Path $contentManifestPath) { (Get-FileHash -Algorithm SHA256 $contentManifestPath).Hash.ToLowerInvariant() } else { "missing" }
 $adapterPath = Join-Path $ArtifactRoot "windows\adapters\place_packet.py"
 $adapterHash = (Get-FileHash -Algorithm SHA256 $adapterPath).Hash.ToLowerInvariant()
-$pythonVersion = (& py -3 --version 2>&1 | Out-String).Trim()
+$orbitPython = Get-OrbitPython
+$pythonVersion = (Invoke-OrbitPython -Arguments @("--version") 2>&1 | Out-String).Trim()
+$pythonLauncherKind = $orbitPython.Exe
 
 $osInfo = Get-CimInstance Win32_OperatingSystem | Select-Object Caption, Version, BuildNumber, OSArchitecture
 $envRecord = [ordered]@{
@@ -31,6 +35,7 @@ $envRecord = [ordered]@{
   computer_name = $env:COMPUTERNAME
   powershell_version = $PSVersionTable.PSVersion.ToString()
   python_runtime_version = $pythonVersion
+  python_interpreter_resolution = $pythonLauncherKind
   repository_build_commit_identity = "package-content-manifest-sha256:$contentManifestHash"
   workflow_contract_version = $manifest.schema_version
   workflow_manifest_version = $manifest.schema_version
@@ -55,8 +60,8 @@ try {
 if (Select-String -Path $testLog -Pattern "skipped .*native Windows gate" -Quiet) {
   throw "Native gate tests were skipped; this is not valid native Windows evidence."
 }
-if (-not (Select-String -Path $testLog -Pattern "Ran 13 tests" -Quiet)) {
-  throw "Expected the 13-test native gate suite to execute."
+if (-not (Select-String -Path $testLog -Pattern "Ran 14 tests" -Quiet)) {
+  throw "Expected the 14-test native gate suite to execute."
 }
 
 $gateFiles = @()
@@ -78,6 +83,11 @@ if (-not (Test-Path $bootstrapLauncherGatePath)) { throw "Missing native evidenc
 $bootstrapLauncherGate = Get-Content -Raw $bootstrapLauncherGatePath | ConvertFrom-Json
 if ($bootstrapLauncherGate.status -ne "PASS") { throw "Native bootstrap launcher gate did not report PASS: LIVE003-NWIN-002" }
 $gateFiles += (Split-Path -Leaf $bootstrapLauncherGatePath)
+$pythonResolutionGatePath = Join-Path $EvidenceDirectory "LIVE003-NWIN-003.json"
+if (-not (Test-Path $pythonResolutionGatePath)) { throw "Missing native evidence file: LIVE003-NWIN-003" }
+$pythonResolutionGate = Get-Content -Raw $pythonResolutionGatePath | ConvertFrom-Json
+if ($pythonResolutionGate.status -ne "PASS") { throw "Native interpreter resolution gate did not report PASS: LIVE003-NWIN-003" }
+$gateFiles += (Split-Path -Leaf $pythonResolutionGatePath)
 
 # Independent PowerShell-to-reconciler smoke proving the launcher and disposable
 # workspace path outside unittest. This remains a test harness action, not an
@@ -132,7 +142,7 @@ Native PowerShell reconciler smoke fixture.
 
 Push-Location $ArtifactRoot
 try {
-  & py -3 -m windows.postrun_secret_scan --evidence-dir "$EvidenceDirectory"
+  Invoke-OrbitPython -Arguments @("-m", "windows.postrun_secret_scan", "--evidence-dir", "$EvidenceDirectory")
   if ($LASTEXITCODE -ne 0) { throw "Post-run trace/secret scan failed with exit code $LASTEXITCODE" }
 } finally {
   Pop-Location
@@ -142,7 +152,7 @@ $postrunScan = Get-Content -Raw (Join-Path $EvidenceDirectory "postrun_secret_sc
 $traceScan = Get-Content -Raw (Join-Path $EvidenceDirectory "NWIN-011.json") | ConvertFrom-Json
 $summary = [ordered]@{
   status = "PASS"
-  native_windows_gate_tests = 13
+  native_windows_gate_tests = 14
   native_gate_files = $gateFiles
   reconciler_smoke = "PASS"
   allowed_executor_operations = @($manifest.allowed_executor_operations)

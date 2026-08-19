@@ -13,10 +13,12 @@ $ErrorActionPreference = "Stop"
 $ResolvedRoot = (Resolve-Path -LiteralPath $Root -ErrorAction Stop).Path
 $ResolvedConfig = (Resolve-Path -LiteralPath $Config -ErrorAction Stop).Path
 
+. (Join-Path $PSScriptRoot "python_launcher.ps1")
+
 $ArtifactRoot = Split-Path -Parent $PSScriptRoot
 Push-Location $ArtifactRoot
 try {
-  & py -3 -m windows.bootstrap_cli --root $ResolvedRoot --config $ResolvedConfig --project-id $ProjectId --workflow-id $WorkflowId --work-item $WorkItem
+  Invoke-OrbitPython -Arguments @("-m", "windows.bootstrap_cli", "--root", $ResolvedRoot, "--config", $ResolvedConfig, "--project-id", $ProjectId, "--workflow-id", $WorkflowId, "--work-item", $WorkItem)
   if ($LASTEXITCODE -ne 0) { throw "Orbit bootstrap failed with exit code $LASTEXITCODE" }
 } finally {
   Pop-Location

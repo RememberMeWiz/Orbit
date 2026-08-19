@@ -755,5 +755,106 @@ class NativeWindowsGateTests(unittest.TestCase):
         })
 
 
+    def test_LIVE003_NATIVE_003_launcher_resolves_python_without_py_launcher(self):
+        """The operator launchers must not depend on the optional 'py' launcher.
+
+        The Windows Python launcher is absent on Microsoft Store installs and on
+        python.org installs where it was deselected. Before this gate existed the
+        launchers invoked 'py -3' directly, so native evidence silently depended
+        on whatever interpreter shim happened to be on PATH during validation.
+        """
+        root = Path(self.tmp.name) / "live003-python-resolution"
+        shutil.copytree(self.source_root / "artifacts", root / "artifacts")
+
+        workspace = root / "artifacts/live_trial/M0-WF-LIVE-003"
+        if workspace.exists():
+            shutil.rmtree(workspace)
+
+        system_root = Path(os.environ.get("SystemRoot", r"C:\Windows"))
+        powershell = system_root / "System32/WindowsPowerShell/v1.0/powershell.exe"
+        system32 = system_root / "System32"
+        self.assertTrue(powershell.is_file(), f"Windows PowerShell 5.1 not found: {powershell}")
+
+        command = [
+            str(powershell), "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+            "-File", r".\artifacts\windows\run_bootstrap.ps1",
+            "-Root", ".",
+            "-Config", r".\artifacts\live003_bootstrap_config.json",
+            "-ProjectId", "Orbit",
+            "-WorkflowId", "orbit-m0-live-trial",
+            "-WorkItem", "M0-WF-LIVE-003",
+        ]
+
+        # Case 1: a 'py' that resolves but cannot run anything must fall back to
+        # python.exe rather than aborting the launcher.
+        shim_dir = root / "broken-py-shim"
+        shim_dir.mkdir(parents=True, exist_ok=True)
+        (shim_dir / "py.cmd").write_text("@echo off\r\nexit /b 1\r\n", encoding="ascii")
+        fallback_env = os.environ.copy()
+        fallback_env["PATH"] = str(shim_dir) + os.pathsep + fallback_env.get("PATH", "")
+
+        fallback = subprocess.run(command, cwd=root, text=True, capture_output=True, env=fallback_env)
+        self.assertEqual(fallback.returncode, 0, fallback.stderr)
+        fallback_lines = [line for line in fallback.stdout.splitlines() if line.strip()]
+        self.assertTrue(fallback_lines, "Bootstrap launcher produced no JSON output under py fallback")
+        fallback_result = json.loads(fallback_lines[-1])
+        self.assertEqual(fallback_result["status"], "INITIALIZED")
+        self.assertEqual(fallback_result["executor_catalog"], ["PLACE_PACKET"])
+
+        state = json.loads((workspace / "state.json").read_text(encoding="utf-8"))
+        self.assertEqual(
+            (state["project_id"], state["workflow_id"], state["work_item"]),
+            ("Orbit", "orbit-m0-live-trial", "M0-WF-LIVE-003"),
+        )
+        self.assertEqual(state["state_revision"], 1)
+
+        # Case 2: with no Python 3 reachable at all the launcher must fail closed
+        # with a stable reason code and must not create accepted workflow state.
+        denied_root = Path(self.tmp.name) / "live003-python-absent"
+        shutil.copytree(self.source_root / "artifacts", denied_root / "artifacts")
+        denied_workspace = denied_root / "artifacts/live_trial/M0-WF-LIVE-003"
+        if denied_workspace.exists():
+            shutil.rmtree(denied_workspace)
+
+        bare_env = os.environ.copy()
+        bare_env["PATH"] = str(system32)
+        bare_env.pop("PYTHONHOME", None)
+
+        denied = subprocess.run(command, cwd=denied_root, text=True, capture_output=True, env=bare_env)
+        combined = (denied.stdout or "") + (denied.stderr or "")
+        self.assertNotEqual(denied.returncode, 0, "Launcher must fail closed with no interpreter")
+        self.assertIn("orbit-python-interpreter-not-found", combined)
+        self.assertFalse(
+            (denied_workspace / "state.json").exists(),
+            "Failed interpreter resolution must not create accepted workflow state",
+        )
+
+        launcher_sources = sorted(
+            (root / "artifacts/windows").glob("run_*.ps1")
+        )
+        residual_py = {
+            path.name: "py -3" not in path.read_text(encoding="utf-8")
+            for path in launcher_sources
+        }
+        self.assertTrue(
+            all(residual_py.values()),
+            f"launcher still hard-codes the optional py launcher: {residual_py}",
+        )
+
+        write_gate_evidence("LIVE003-NWIN-003", {
+            "status": "PASS",
+            "fallback_status": fallback_result["status"],
+            "fallback_state_revision": fallback_result["state_revision"],
+            "fallback_executor_catalog": fallback_result["executor_catalog"],
+            "broken_py_shim_on_path": True,
+            "absent_interpreter_returncode": denied.returncode,
+            "absent_interpreter_reason_code": "orbit-python-interpreter-not-found",
+            "accepted_state_created_on_failure": False,
+            "launchers_free_of_hard_py_dependency": residual_py,
+            "elevation_requested": False,
+            "developer_mode_dependency": False,
+        })
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
