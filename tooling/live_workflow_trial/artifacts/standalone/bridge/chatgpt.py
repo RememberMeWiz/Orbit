@@ -30,6 +30,8 @@ POLL_INTERVAL = 3.0
 # briefly shows no stop control between thinking and streaming, so a single
 # idle observation is not proof of completion.
 IDLE_CONFIRM_SECONDS = 6.0
+# How long to wait for a pasted message to appear in the accessibility tree.
+STAGE_VERIFY_SECONDS = 8.0
 
 
 @dataclass
@@ -154,7 +156,7 @@ class ChatGptAdapter:
 
     # -- SEND_BOUNDED_MESSAGE --------------------------------------------
 
-    def stage_message(self, text: str) -> ChatTransportResult:
+    def stage_message(self, text: str, *, verify_token: str = "") -> ChatTransportResult:
         if not text or not text.strip():
             return ChatTransportResult.deny("SEND_BOUNDED_MESSAGE", "message-empty")
         state = self.driver.response_state()
@@ -165,7 +167,35 @@ class ChatGptAdapter:
         result = self.driver.set_message(text)
         if not result.ok:
             return ChatTransportResult.deny("SEND_BOUNDED_MESSAGE", result.reason_code, str(result.get("detail", "")))
-        return ChatTransportResult.allow("SEND_BOUNDED_MESSAGE", {"staged_length": len(text)})
+
+        # Read the composer back. Paste can be swallowed by a re-render or land
+        # in a different field; only the app's own report of its contents proves
+        # what would actually be transmitted.
+        #
+        # ProseMirror commits a paste to the accessibility tree asynchronously,
+        # so a single immediate sample can legitimately miss content that is
+        # already there. Poll instead of guessing a delay -- and keep failing
+        # closed if it never appears.
+        deadline = self._now() + STAGE_VERIFY_SECONDS
+        actual = ""
+        while True:
+            staged = self.driver.read_composer()
+            if not staged.ok:
+                return ChatTransportResult.deny("SEND_BOUNDED_MESSAGE", staged.reason_code)
+            actual = str(staged.data.get("text", ""))
+            if not verify_token or verify_token in actual:
+                break
+            if self._now() >= deadline:
+                return ChatTransportResult.deny(
+                    "SEND_BOUNDED_MESSAGE", "staged-message-verification-failed",
+                    f"token {verify_token!r} absent from composer after "
+                    f"{STAGE_VERIFY_SECONDS:.0f}s")
+            self._sleep(0.5)
+        return ChatTransportResult.allow("SEND_BOUNDED_MESSAGE", {
+            "staged_length": len(text),
+            "composer_length": len(actual),
+            "verified_token": verify_token or "",
+        })
 
     def send(self, *, expect_endpoint_id: str) -> ChatTransportResult:
         """Press Send, re-verifying the destination immediately beforehand."""

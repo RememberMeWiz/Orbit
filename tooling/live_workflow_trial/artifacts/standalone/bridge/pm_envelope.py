@@ -65,7 +65,8 @@ class PMRequest:
     def render(self) -> str:
         """Human-readable and machine-readable in one message."""
         lines = [
-            "PM_REQUEST",
+            "ORBIT_PM_REQUEST",
+            f"version: {ENVELOPE_VERSION}",
             f"request_id: {self.request_id}",
             f"work_item: {self.work_item}",
             f"current_owner: {self.current_owner}",
@@ -80,7 +81,9 @@ class PMRequest:
         if self.workflow_state:
             lines.append("workflow_state: " + json.dumps(self.workflow_state, sort_keys=True))
         lines.append("awaiting: ORBIT_DIRECTIVE")
-        return "\n".join(lines)
+        # Fenced so it is unmistakably machine-generated in the chat, and so PM
+        # can see exactly which request_id a directive has to answer.
+        return "```\n" + "\n".join(lines) + "\n```"
 
     def to_dict(self) -> Dict[str, Any]:
         return {

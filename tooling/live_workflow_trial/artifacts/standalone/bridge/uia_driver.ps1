@@ -189,35 +189,70 @@ switch ($Operation) {
     Done @{ project_markers = $names; active_chat_title = $titleBtn }
   }
 
-  # Type a bounded message into the composer. Text is set as a value, never as
-  # simulated keystrokes that could reach another window.
+  # Stage a bounded message into the composer via clipboard paste.
+  #
+  # NEVER type this with SendKeys. A newline sent as a keystroke is an Enter
+  # press, and Enter submits in this app -- typing a multi-line message
+  # transmits it line by line during staging, before any verification gate can
+  # run. Pasting inserts the text as literal content and sends nothing.
+  #
+  # The clipboard is global state, so the previous contents are saved and
+  # restored around the paste.
   "set_message" {
     $w = Get-ChatWindow
     $text = [string]$P.text
     if (-not $text) { Fail "message-empty" }
+
     $composer = $null
     foreach ($e in (All-Descendants $w)) {
       if ((CT $e) -eq "Edit" -and (ClassOf $e) -like "*ProseMirror*") { $composer = $e; break }
     }
     if ($null -eq $composer) { Fail "composer-not-found" }
+
+    $previousClipboard = $null
+    try { $previousClipboard = Get-Clipboard -Raw -ErrorAction SilentlyContinue } catch { }
+
     try {
+      Set-Clipboard -Value $text
       $composer.SetFocus()
-      Start-Sleep -Milliseconds 200
+      Start-Sleep -Milliseconds 250
+      # Select-all then paste replaces any stale draft without pressing Enter.
       [System.Windows.Forms.SendKeys]::SendWait("^a")
-      Start-Sleep -Milliseconds 100
-      $escaped = $text -replace '([+^%~(){}\[\]])', '{$1}'
-      [System.Windows.Forms.SendKeys]::SendWait($escaped)
-      Start-Sleep -Milliseconds 300
-    } catch { Fail "composer-set-failed" $_.Exception.Message }
-    Done @{ length = $text.Length }
+      Start-Sleep -Milliseconds 120
+      [System.Windows.Forms.SendKeys]::SendWait("^v")
+      Start-Sleep -Milliseconds 450
+    } catch {
+      Fail "composer-set-failed" $_.Exception.Message
+    } finally {
+      try {
+        if ($null -ne $previousClipboard) { Set-Clipboard -Value $previousClipboard }
+        else { Set-Clipboard -Value " " }
+      } catch { }
+    }
+    Done @{ length = $text.Length; method = "clipboard-paste" }
   }
 
-  # Read the composer back so the caller can verify what is staged.
+  # Read the composer contents back so the caller can verify exactly what is
+  # staged before anything is transmitted. The Name property is only the
+  # placeholder, so the actual text comes from TextPattern/ValuePattern.
   "read_composer" {
     $w = Get-ChatWindow
     foreach ($e in (All-Descendants $w)) {
       if ((CT $e) -eq "Edit" -and (ClassOf $e) -like "*ProseMirror*") {
-        Done @{ name = (NM $e) }
+        $text = ""
+        $source = "none"
+        try {
+          $tp = $e.GetCurrentPattern([System.Windows.Automation.TextPattern]::Pattern)
+          $text = $tp.DocumentRange.GetText(20000)
+          $source = "TextPattern"
+        } catch {
+          try {
+            $vp = $e.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)
+            $text = $vp.Current.Value
+            $source = "ValuePattern"
+          } catch { }
+        }
+        Done @{ name = (NM $e); text = $text; source = $source; length = $text.Length }
       }
     }
     Fail "composer-not-found"

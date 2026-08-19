@@ -128,7 +128,9 @@ class ChatTransportResult:
 
     @staticmethod
     def deny(operation: str, reason_code: str, detail: str = "", delivery_state: str = "") -> "ChatTransportResult":
-        return ChatTransportResult(False, operation, reason_code, detail, delivery_state)
+        # Denials carry an empty dict rather than None so callers can read
+        # result.data uniformly without a null check on every branch.
+        return ChatTransportResult(False, operation, reason_code, detail, delivery_state, {})
 
     @staticmethod
     def allow(operation: str, data: Dict[str, Any], delivery_state: str = "") -> "ChatTransportResult":
