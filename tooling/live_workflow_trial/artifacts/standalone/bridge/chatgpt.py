@@ -25,6 +25,7 @@ from pathlib import Path
 from workflow.core.validation import NAME_RE, parse_header
 
 from .contracts import ChatEndpoint, ChatTransportResult
+from .delivery import DeliveryError, DeliveryLedger, digest_text
 from .registry import ChatEndpointRegistry
 from .uia import UiaDriver
 
@@ -473,3 +474,107 @@ class ChatGptAdapter:
         if not result.ok:
             return ChatTransportResult.deny("ATTACH_ARTIFACT", result.reason_code)
         return ChatTransportResult.allow("ATTACH_ARTIFACT", dict(result.data))
+
+    # -- durable delivery -------------------------------------------------
+
+    def deliver(
+        self,
+        *,
+        ledger: DeliveryLedger,
+        request_id: str,
+        endpoint_id: str,
+        message: str,
+        verify_token: str = "",
+        artifact_path: "Optional[Path]" = None,
+        expected_sha256: str = "",
+        stop_path: "Optional[Path]" = None,
+    ) -> ChatTransportResult:
+        """One governed delivery, durable across a crash at any point.
+
+        Ordering here is the safety property, not a style choice: the intent to
+        actuate is written to disk *before* Send is pressed, so the uncertain
+        window is recorded rather than invisible. Everything before that point
+        is freely retryable because nothing external has happened.
+        """
+        # STOP outranks everything, and is checked before any state is opened.
+        if stop_path is not None and Path(stop_path).is_file():
+            return ChatTransportResult.deny(
+                "SEND_BOUNDED_MESSAGE", "stop-active", str(stop_path), delivery_state="PENDING_SEND")
+
+        allowed, why = ledger.may_send(request_id)
+        if not allowed:
+            # Covers already-delivered, awaiting-confirmation and, critically,
+            # AMBIGUOUS -- which must never be resent without a human decision.
+            existing = ledger.get(request_id) or {}
+            return ChatTransportResult.deny(
+                "SEND_BOUNDED_MESSAGE", why, f"request {request_id}",
+                delivery_state=str(existing.get("state", "")))
+
+        artifact_digest = ""
+        if artifact_path is not None:
+            source = Path(artifact_path)
+            if not source.is_file():
+                return ChatTransportResult.deny("ATTACH_ARTIFACT", "attach-file-not-found", str(source))
+            artifact_digest = hashlib.sha256(source.read_bytes()).hexdigest()
+            if expected_sha256 and artifact_digest != expected_sha256:
+                return ChatTransportResult.deny(
+                    "ATTACH_ARTIFACT", "attach-digest-mismatch",
+                    f"expected {expected_sha256}, file is {artifact_digest}")
+
+        message_digest = digest_text(message)
+        try:
+            ledger.begin(request_id=request_id, endpoint_id=endpoint_id,
+                         artifact_digest=artifact_digest, message_digest=message_digest)
+        except DeliveryError as exc:
+            return ChatTransportResult.deny("SEND_BOUNDED_MESSAGE", str(exc))
+
+        focused = self.focus(endpoint_id)
+        if not focused.ok:
+            ledger.mark_failed(request_id, reason_code=focused.reason_code)
+            return focused
+
+        if artifact_path is not None:
+            attached = self.attach_artifact(
+                endpoint_id=endpoint_id, path=Path(artifact_path), expected_sha256=artifact_digest)
+            if not attached.ok:
+                ledger.mark_failed(request_id, reason_code=attached.reason_code)
+                return attached
+
+        staged = self.stage_message(message, verify_token=verify_token)
+        if not staged.ok:
+            ledger.mark_failed(request_id, reason_code=staged.reason_code)
+            return staged
+
+        try:
+            ledger.mark_staged(request_id, artifact_digest=artifact_digest, message_digest=message_digest)
+            # Recomputed here rather than reused: this is the last moment the
+            # payload can be checked before an irreversible external effect.
+            if artifact_path is not None:
+                current = hashlib.sha256(Path(artifact_path).read_bytes()).hexdigest()
+                if current != artifact_digest:
+                    ledger.mark_failed(request_id, reason_code="artifact-changed-before-send")
+                    return ChatTransportResult.deny(
+                        "SEND_BOUNDED_MESSAGE", "artifact-changed-before-send",
+                        f"staged {artifact_digest}, now {current}")
+            ledger.mark_actuating(request_id, artifact_digest=artifact_digest, message_digest=message_digest)
+        except DeliveryError as exc:
+            return ChatTransportResult.deny("SEND_BOUNDED_MESSAGE", str(exc))
+
+        # Anything from here on is post-actuation: a failure is AMBIGUOUS, never
+        # FAILED, because the press may already have landed.
+        sent = self.send(expect_endpoint_id=endpoint_id)
+        if not sent.ok:
+            ledger.mark_failed(request_id, reason_code=sent.reason_code)
+            record = ledger.get(request_id) or {}
+            return ChatTransportResult.deny(
+                "SEND_BOUNDED_MESSAGE", sent.reason_code, sent.detail,
+                delivery_state=str(record.get("state", "AMBIGUOUS")))
+
+        record = ledger.mark_sent(request_id)
+        return ChatTransportResult.allow("SEND_BOUNDED_MESSAGE", {
+            "request_id": request_id,
+            "endpoint_id": endpoint_id,
+            "artifact_digest": artifact_digest,
+            "message_digest": message_digest,
+            "attempt": record.get("attempt"),
+        }, delivery_state="SENT_UNCONFIRMED")

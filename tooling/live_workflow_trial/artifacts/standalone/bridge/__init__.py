@@ -13,6 +13,7 @@ from .contracts import (
     ChatTransportRequest,
     ChatTransportResult,
 )
+from .delivery import DELIVERY_STATES, DeliveryError, DeliveryLedger, digest_text
 from .diagnostics import FeasibilityReport, assess, probe_uia, run as run_diagnostic
 from .pm_envelope import (
     DIRECTIVE_ACTIONS,
@@ -32,6 +33,7 @@ __all__ = [
     "CHAT_APPS", "CHAT_OPERATIONS", "DELIVERY_STATES", "DIRECTIVE_ACTIONS",
     "KNOWN_ROLE_SLUGS", "BridgeError", "ChatEndpoint", "ChatEndpointRegistry",
     "ChatTransportRequest", "ChatTransportResult", "DirectiveVerdict",
+    "DELIVERY_STATES", "DeliveryError", "DeliveryLedger", "digest_text",
     "FeasibilityReport", "PMBridgeState", "PMDirective", "PMRequest",
     "TeachingTrace", "TeachingTraceStore", "assess", "condition_digest",
     "fold_title", "parse_envelope", "probe_uia", "request_identity", "run_diagnostic",
