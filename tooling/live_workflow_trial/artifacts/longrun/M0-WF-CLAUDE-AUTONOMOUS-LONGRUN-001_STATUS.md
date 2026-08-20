@@ -5,19 +5,19 @@
 
 | Field | Value |
 | :--- | :--- |
-| Updated | 2026-08-20T06:35Z |
+| Updated | 2026-08-20T11:25Z |
 | Branch | `claude/m0-autonomous-longrun-001` |
 | Started from | `446e43af18445067a9bc227bb810ce17069929cf` (head of `claude/m0-wf-apprentice-002`) |
-| HEAD | see latest commit |
-| Current phase | **A — finish zero-courier core correctness** |
-| Current objective | A3 — PM round-trip control, then Phase B live trial |
+| HEAD | `328cf5a` |
+| Current phase | **B — live zero-courier trial** |
+| Current objective | B1 — first real Worker round trip with courier actions = 0 |
 | Blocker | NONE |
 
 ---
 
 ## Completed
 
-### A1 — canonical header compatibility (§7, `APPROVED_WITH_GUARDS`) — DONE
+### A1 — canonical header compatibility — DONE · `30253be`
 
 The canonical parser unwraps exactly one full-value Markdown inline-code
 wrapper, so ``- Work Item: `M0-WF-LIVE-003` `` validates identically to the
@@ -32,9 +32,7 @@ doubled, multiple and interior backticks left verbatim; bare double-backtick
 does not collapse to empty; filename/SHA-256/handoff-id/sequence/sender/
 recipient and routing authority unchanged; duplicate critical headers still fail.
 
-`30253be feat(validation): canonical header accepts inline-code wrapped scalars`
-
-### A2 — durable exactly-once delivery — DONE
+### A2 — durable exactly-once delivery — DONE · `25d07f0`
 
 `standalone/bridge/delivery.py`. The hazard being removed: pressing Send is an
 *external* effect, so if the process dies between the click and the receipt, a
@@ -52,11 +50,6 @@ reconciled to `AMBIGUOUS` on read — because a crash leaves no chance to run
 cleanup, so whoever next opens the ledger must resolve it. `AMBIGUOUS` never
 auto-resends.
 
-Wired into `ChatGptAdapter.deliver()`, so the ledger is enforced rather than
-merely available: STOP is checked before any state is opened, the artifact
-digest is recomputed at the last moment before actuation, and every
-post-actuation failure resolves to `AMBIGUOUS` rather than `FAILED`.
-
 **Defect found by its own tests:** `mark_failed` matched only `SEND_ACTUATED`,
 but `get()` calls `load()`, which had already reconciled that to `AMBIGUOUS` —
 so an in-process failure right after actuation fell through to the `FAILED`
@@ -64,10 +57,94 @@ branch, which is *retryable*. That silently converted an unsafe-to-retry state
 into a resendable one: exactly the double-send this ledger exists to prevent.
 Both post-actuation states now stay ambiguous.
 
-27 `DLV` tests: lifecycle, six crash-point scenarios, payload-integrity,
-work-item isolation, malformed-ledger, and seven `deliver()` integration tests
-including *an ambiguous request must not touch the app at all* (asserted by the
-driver call list being empty).
+### A3 — PM-supervised apprenticeship loop — DONE · `fc7f18f`
+
+`standalone/bridge/orchestrator.py`. Wake PM, wait for a machine-checkable
+directive, dispatch where PM said, wait for the worker, collect, report back.
+
+Two rules carry the safety: PM decides routing (Orbit never picks a target, and
+a target named only in prose is refused), and nothing external happens twice.
+A *failed* post does not open a pending request — Orbit must never wait for an
+answer to a question PM never received.
+
+### C1 — restart and recovery — DONE · `f7399be`
+
+Restart is covered as its own property rather than inferred from unit tests.
+Each test rebuilds the loop from the same files, which is exactly what a
+restarted process sees, and asserts that no restart duplicates an external
+effect or drops a decision: a pending PM question survives, a consumed
+directive stays consumed, a dispatch that already actuated stays `AMBIGUOUS`
+instead of resending, a STOP taken before send leaves nothing to reconcile.
+
+### C2 — accessibility runtime guard — DONE · `ced97b5`
+
+The bridge only works when the renderer exposes a semantic tree, which is a
+launch-time property: an app already running without
+`--force-renderer-accessibility` cannot be persuaded to grow one. The guard
+therefore has exactly two moves — start the app with the flag when it is not
+running, or report precisely why the surface is unusable.
+
+**It never closes, kills or restarts a running app.** The Product Owner may be
+mid-conversation in that window, and an unattended process that ends a human's
+session to unblock itself is a worse failure than staying blocked. Every
+unusable-but-running case ends in `NEEDS_HUMAN_RESTART` carrying the remedy.
+`launch_app` refuses outright if any ChatGPT process exists, and the driver
+contains no `Stop-Process`, `taskkill`, `Kill` or `CloseMainWindow` — asserted
+by test rather than left to review.
+
+`app_state` separates *the flag was passed* (read from the command line) from
+*the flag took effect* (measured by finding a composer in the tree). `launch_app`
+resolves the executable from the installed package rather than a pinned path,
+so an ordinary app update cannot silently disarm the guard.
+
+### C3 — committed endpoint registry — DONE · `f7399be`
+
+The five role chats PM actually addresses are committed configuration
+(`standalone/bridge/orbit_endpoints.json`) rather than test fixtures. Adding a
+role chat is a reviewable data change, and `enabled` is separate from
+registration so a chat can be known without being writable.
+
+Verified live against the running desktop app:
+
+| endpoint | enabled | resolves to |
+| :--- | :--- | :--- |
+| `orbit-pm` | yes | Orbit PM |
+| `windows-worker` | yes | Windows Workflow |
+| `architecture-tl` | yes | Architecture TL |
+| `qa-safety` | yes | QA TL |
+| `product-research` | yes | Product Research |
+| `android-worker` | **no** | denies `endpoint-disabled` |
+| `memory-worker` | **no** | denies `endpoint-disabled` |
+
+The two disabled endpoints deny even though both chats exist and are observed.
+
+### B (runner) — the full cycle as one governed sequence — DONE · `328cf5a`
+
+`standalone/bridge/roundtrip.py`. `Orbit PM → Orbit → Worker → Orbit → Orbit PM`
+end to end, with the Product Owner's only involvement being the decision itself.
+
+Each step declares what it must produce, and anything else ends the cycle where
+it stands rather than improvising past it: a blocked surface posts nothing at
+all, a directive for another work item never reaches a worker chat, a target PM
+never registered is never focused, a worker that never finishes is never
+collected from, and a missing artifact is never reported to PM as success.
+
+Every step is journalled before and after, so an interrupted cycle can be read
+afterwards to see how far it got, and each step stays individually resumable
+through the same durable state the CLI verbs use.
+
+### Operator CLI — `standalone/bridge/apprentice_cli.py`
+
+```text
+status   wake   poll   dispatch   await   collect   cycle   clear
+```
+
+Step-at-a-time by design: each verb is one invocation leaving durable state
+behind, which makes a crash between two steps an ordinary restart rather than a
+special case. Every verb that touches the app preflights through the
+accessibility guard, so a dead surface is reported with its remedy instead of
+failing deeper in as an opaque driver error. `--no-launch` withholds the launch
+for supervised runs.
 
 ---
 
@@ -75,20 +152,28 @@ driver call list being empty).
 
 ```text
 workflow     67 pass
-standalone  157 pass   (2 skipped: symlink creation needs Developer Mode;
+standalone  251 pass   (2 skipped: symlink creation needs Developer Mode;
                         Windows junction coverage supersedes them)
 native       14 pass
-TOTAL       238 pass, 2 skipped, 0 release-blocking skips
+TOTAL       332 pass, 2 skipped, 0 release-blocking skips
 ```
 
 ---
 
 ## Live-trial result
 
-None since A1. The bridge itself was proven live in the previous burst:
-verified chat focus, staged-message readback, send, semantic completion
-detection, clipboard file-drop attachment, and artifact collection to an exact
-path with SHA-256 and header validation.
+**C2 and C3 verified live this run** against the running desktop app:
+
+- `app_state` reports flag / trusted path / readiness over 793 accessibility
+  descendants
+- `launch_app` refuses with `launch-refused-already-running` — the never-kill
+  guard proven live, not merely unit-tested
+- `AccessibilityGuard.ensure()` returns `READY` without touching the session
+- all five enabled endpoints resolve to exactly one observed chat; both
+  disabled endpoints deny
+
+**B1 not yet run live.** The runner and its offline proof are complete; the
+live cycle requires a real PM directive in the Orbit PM conversation.
 
 ---
 
@@ -100,10 +185,9 @@ None known.
 
 ## Next action
 
-**A3 — PM round-trip control**, then **Phase B1**: the first full real
-Worker round trip (`Orbit PM → Orbit → Windows Worker → Orbit → Orbit PM`) with
-Product Owner courier actions = 0, now that A1 makes a real returned handoff
-validate and A2 makes the send exactly-once across a crash.
+**B1** — first full real Worker round trip
+(`Orbit PM → Orbit → Windows Worker → Orbit → Orbit PM`) with Product Owner
+courier actions = 0, via `apprentice_cli … cycle`.
 
 ---
 
@@ -112,6 +196,7 @@ validate and A2 makes the send exactly-once across a crash.
 ```text
 workflow executor catalog        ["PLACE_PACKET"]   unchanged
 standalone write/process/Git     gated              unchanged
+app termination capability       none               asserted by test
 wrong-recipient sends            0
 wrong-artifact substitution      0
 duplicate workflow advancement   0
@@ -126,4 +211,4 @@ force-push / history rewrite     none
 ## Claude usage
 
 Authorised to use the full remaining allowance. Consumed so far: moderate —
-phases A1 and A2.
+phases A1–A3, C1–C3, and the Phase B runner.
