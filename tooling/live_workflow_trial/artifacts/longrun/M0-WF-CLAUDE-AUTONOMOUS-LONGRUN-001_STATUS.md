@@ -5,13 +5,13 @@
 
 | Field | Value |
 | :--- | :--- |
-| Updated | 2026-08-20T11:25Z |
+| Updated | 2026-08-20T12:05Z |
 | Branch | `claude/m0-autonomous-longrun-001` |
 | Started from | `446e43af18445067a9bc227bb810ce17069929cf` (head of `claude/m0-wf-apprentice-002`) |
-| HEAD | `328cf5a` |
+| HEAD | `0f4cc5c` |
 | Current phase | **B — live zero-courier trial** |
-| Current objective | B1 — first real Worker round trip with courier actions = 0 |
-| Blocker | NONE |
+| Current objective | B2 — second hop (architecture-tl), blocked on a human click |
+| Blocker | **Architecture TL is showing "Continue with Work?" and exposes no Continue control to accessibility. A human must click it.** |
 
 ---
 
@@ -152,42 +152,84 @@ for supervised runs.
 
 ```text
 workflow     67 pass
-standalone  251 pass   (2 skipped: symlink creation needs Developer Mode;
+standalone  295 pass   (2 skipped: symlink creation needs Developer Mode;
                         Windows junction coverage supersedes them)
 native       14 pass
-TOTAL       332 pass, 2 skipped, 0 release-blocking skips
+TOTAL       376 pass, 2 skipped, 0 release-blocking skips
 ```
 
 ---
 
 ## Live-trial result
 
-**C2 and C3 verified live this run** against the running desktop app:
+### B1 — COMPLETE. Courier actions: 0.
 
-- `app_state` reports flag / trusted path / readiness over 793 accessibility
-  descendants
-- `launch_app` refuses with `launch-refused-already-running` — the never-kill
-  guard proven live, not merely unit-tested
-- `AccessibilityGuard.ensure()` returns `READY` without touching the session
-- all five enabled endpoints resolve to exactly one observed chat; both
-  disabled endpoints deny
+Orbit carried a real piece of work from the PM conversation to a worker and
+back without the Product Owner touching a file.
 
-**B1 not yet run live.** The runner and its offline proof are complete; the
-live cycle requires a real PM directive in the Orbit PM conversation.
+| step | outcome |
+| :--- | :--- |
+| wake_pm | `PM_WOKEN` · `pmreq-9ae12ea75546663186d7` |
+| await_directive | `DIRECTIVE_ACCEPTED` · `pmdir-20260820-1930-b1-live-001` |
+| dispatch | `DISPATCHED` → `windows-worker` |
+| await_worker | `WORKER_RESPONDED` · 27.5s, 7 polls |
+| collect | `COLLECTED` · 6917 bytes, header-validated |
+| report_to_pm | `PM_WOKEN` · digest attached |
 
----
+PM was asked which role should take the work and answered `windows-worker` —
+the registry slug, not the chat's display title. Evidence in
+`longrun/evidence/b1/`.
 
-## Open defects
+The worker returned five findings on the C2 guard, four actionable, two of them
+real defects. All are now implemented (`bc46e6c`).
 
-None known.
+### B2 — second hop dispatched, then blocked
 
----
+PM read the B1 result and directed the next hop to `architecture-tl`. Orbit
+dispatched the assignment **with the worker's handoff attached as a real file**,
+exercising the clipboard file-drop path live.
 
-## Next action
+That conversation then entered a state Orbit cannot pass:
 
-**B1** — first full real Worker round trip
-(`Orbit PM → Orbit → Windows Worker → Orbit → Orbit PM`) with Product Owner
-courier actions = 0, via `apprentice_cli … cycle`.
+```text
+Continue with Work?
+This request requires creating and delivering a file artifact.
+```
+
+The composer is removed and **no Continue or Cancel control is exposed to
+accessibility at all** — enumerating all 110 buttons in the window finds only
+sidebar controls. Orbit did not click anything: granting that confirmation
+starts real work and is a decision, not a mechanical step.
+
+Reported to PM as `pmreq-68a8bdce7dd30a15fe1d`.
+
+**To unblock: a human clicks Continue in the Architecture TL conversation.**
+Orbit then resumes with `await --endpoint architecture-tl` and `collect`.
+
+## Defects found live, all fixed
+
+None of these were reachable from the stubbed tests.
+
+1. **Keystrokes were sent without checking which window was in front** (`a7cd192`).
+   `SendKeys` targets the foreground window and a UIA `SetFocus` on a background
+   window does not make it foreground, so `Ctrl+A`/`Ctrl+V` performed
+   select-all-and-replace in whatever *was* in front. All six keystroke sites
+   now raise the intended window and re-check the foreground immediately before
+   sending, or send nothing.
+
+2. **Orbit read its own reply template as PM's decision** (`a7cd192`). The
+   transcript is now scanned newest-first, malformed candidates are skipped, and
+   any value still wearing its `<angle brackets>` is refused as unfilled.
+
+3. **A streaming window looked broken** (`ae0e65c`). Send is replaced by Stop
+   while a response streams, so readiness failed exactly when Orbit needed to
+   watch a worker. Readiness now accepts either transport control.
+
+4. **One stuck conversation stranded the whole app** (`0f4cc5c`). Three places
+   measured app-wide health against whichever chat was on screen. Preflight now
+   asks `drivable` rather than `ok`; `focus()` requires only the chat list
+   before switching; and the post-switch header check is polled rather than
+   raced against the outgoing conversation.
 
 ---
 
@@ -202,6 +244,7 @@ wrong-artifact substitution      0
 duplicate workflow advancement   0
 arbitrary command from handoff   0
 secret leakage                   0
+app confirmations auto-clicked   0
 shared branches moved            none (main 6928e5b, integration 0813f44)
 force-push / history rewrite     none
 ```
