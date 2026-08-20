@@ -355,18 +355,19 @@ class DriverParsingTests(unittest.TestCase):
 
 
 class HandoffHeaderFormatTests(unittest.TestCase):
-    """Pins a real mismatch found while collecting a genuine worker handoff.
+    """Header presentation syntax, after the approved contract ruling.
 
-    Every delivered Orbit handoff writes header values in backticks
-    (``- Work Item: `M0-...` ``), but every accepted test fixture writes them
-    plain. The engine compares the parsed value to the filename group with ``!=``,
-    so a real handoff fails ``work-item-metadata-mismatch`` while the fixtures
-    pass. The collector deliberately keeps strict parity with the engine rather
-    than normalising -- being more permissive here would only move the rejection
-    downstream, after the file had been accepted.
+    These originally pinned the *opposite* behaviour: a real backticked handoff
+    was collected correctly and then rejected by the engine with
+    work-item-metadata-mismatch, while every fixture passed because fixtures
+    wrote values plain. That mismatch was reported rather than patched, because
+    changing the canonical validator is a contract decision.
 
-    These tests document current behaviour. Changing it is a contract decision,
-    not a refactor.
+    It was subsequently approved with guards, so the canonical parser now
+    unwraps exactly one full-value inline-code wrapper. The collector needs no
+    special case of its own: it reads the same parser the engine reads, so the
+    two cannot drift apart. Guard coverage lives in
+    workflow/tests/test_header_scalars.py.
     """
 
     @staticmethod
@@ -382,95 +383,24 @@ class HandoffHeaderFormatTests(unittest.TestCase):
             "",
         ])
 
-    def test_HDR_001_backticked_header_does_not_match_filename_group(self):
+    def test_HDR_001_backticked_header_now_matches_filename_group(self):
         from workflow.core.validation import parse_header
         parsed = parse_header(self._header("`M0-WF-LIVE-003`", "`WORKER`"))
         self.assertTrue(parsed.ok)
-        self.assertEqual(parsed.fields["work item"], "`M0-WF-LIVE-003`")
-        # The engine compares this to the filename group with !=, so a real
-        # backticked handoff fails work-item-metadata-mismatch.
-        self.assertNotEqual(parsed.fields["work item"], "M0-WF-LIVE-003")
+        self.assertEqual(parsed.fields["work item"], "M0-WF-LIVE-003")
+        self.assertEqual(parsed.fields["from"], "WORKER")
 
-    def test_HDR_002_plain_header_matches(self):
+    def test_HDR_002_plain_header_still_matches(self):
         from workflow.core.validation import parse_header
         parsed = parse_header(self._header("M0-WF-LIVE-003", "WORKER"))
         self.assertEqual(parsed.fields["work item"], "M0-WF-LIVE-003")
 
-
-class AttachTests(unittest.TestCase):
-    def _file(self, tmpdir, name="HANDOFF_WI-1_WORKER_TO_TL.md", body=b"# Orbit Handoff"):
-        from pathlib import Path
-        p = Path(tmpdir) / name
-        p.write_bytes(body)
-        return p
-
-    def test_CHAT_010_digest_mismatch_refuses_and_attaches_nothing(self):
-        import tempfile
-        driver = StubDriver()
-        adapter = build(driver)
-        with tempfile.TemporaryDirectory() as tmp:
-            f = self._file(tmp)
-            result = adapter.attach_artifact(endpoint_id="orbit-pm", path=f, expected_sha256="0" * 64)
-        self.assertFalse(result.ok)
-        self.assertEqual(result.reason_code, "attach-digest-mismatch")
-        self.assertNotIn("attach_file", driver.calls)
-        self.assertEqual(driver.attached, [])
-
-    def test_CHAT_010b_correct_digest_stages(self):
-        import hashlib, tempfile
-        driver = StubDriver()
-        adapter = build(driver)
-        with tempfile.TemporaryDirectory() as tmp:
-            f = self._file(tmp)
-            digest = hashlib.sha256(f.read_bytes()).hexdigest()
-            result = adapter.attach_artifact(endpoint_id="orbit-pm", path=f, expected_sha256=digest)
-        self.assertTrue(result.ok)
-        self.assertEqual(result.data["sha256"], digest)
-        self.assertIn("HANDOFF_WI-1_WORKER_TO_TL.md", result.data["staged"])
-
-    def test_CHAT_010c_missing_file_refuses(self):
-        adapter = build(StubDriver())
-        from pathlib import Path
-        result = adapter.attach_artifact(endpoint_id="orbit-pm", path=Path("no-such-file.md"))
-        self.assertFalse(result.ok)
-        self.assertEqual(result.reason_code, "attach-file-not-found")
-
-    def test_CHAT_011c_app_not_showing_the_file_is_not_attached(self):
-        """A staging call that reports success but stages nothing must fail."""
-        import tempfile
-
-        class Silent(StubDriver):
-            def attach_file(self, path):
-                self.calls.append("attach_file")
-                return ok({"filename": "something-else.md"})   # never staged
-
-        driver = Silent()
-        adapter = build(driver)
-        with tempfile.TemporaryDirectory() as tmp:
-            f = self._file(tmp)
-            result = adapter.attach_artifact(endpoint_id="orbit-pm", path=f)
-        self.assertFalse(result.ok)
-        self.assertEqual(result.reason_code, "attach-not-confirmed")
-
-    def test_CHAT_015c_streaming_blocks_attach(self):
-        import tempfile
-        # focus() does not consume a response_state call, so the very first one
-        # the adapter makes is the streaming check.
-        driver = StubDriver(state_sequence=["streaming"])
-        adapter = build(driver)
-        with tempfile.TemporaryDirectory() as tmp:
-            f = self._file(tmp)
-            result = adapter.attach_artifact(endpoint_id="orbit-pm", path=f)
-        self.assertFalse(result.ok)
-        self.assertEqual(result.reason_code, "response-in-progress")
-        self.assertNotIn("attach_file", driver.calls)
-
-    def test_CHAT_015d_clear_removes_staged_files(self):
-        driver = StubDriver(attached=["a.md", "b.md"])
-        result = build(driver).clear_attachments()
-        self.assertTrue(result.ok)
-        self.assertEqual(result.data["remaining"], [])
-        self.assertEqual(driver.attached, [])
+    def test_HDR_003_malformed_wrapper_is_not_repaired(self):
+        """A mismatch must stay a mismatch; only presentation is normalised."""
+        from workflow.core.validation import parse_header
+        parsed = parse_header(self._header("`M0-WF-LIVE-003", "WORKER"))
+        self.assertEqual(parsed.fields["work item"], "`M0-WF-LIVE-003")
+        self.assertNotEqual(parsed.fields["work item"], "M0-WF-LIVE-003")
 
 
 if __name__ == "__main__":

@@ -16,6 +16,27 @@ SECTION_RE = re.compile(r"^\s*#{1,6}\s+\S")
 HEADER_FIELD_RE = re.compile(r"^\s*-\s*([^:]+):\s*(.*?)\s*$")
 CRITICAL_HEADER_FIELDS = {"work item", "from", "to", "status", "handoff id", "sequence"}
 
+# A single Markdown inline-code wrapper around an entire header scalar is
+# presentation, not identity: real Orbit handoffs write
+#   - Work Item: `M0-WF-LIVE-003`
+# while fixtures write it plain. Both denote the same work item, so the parser
+# unwraps exactly this one shape.
+#
+# Deliberately narrow. Only a lone backtick at each end of the already-trimmed
+# value is removed, and only when what remains contains no backtick of its own.
+# Unbalanced, nested, doubled or interior backticks are left exactly as written
+# so a malformed header is never silently "repaired" into a different value.
+_WRAPPED_SCALAR_RE = re.compile(r"^`(?P<inner>[^`]+)`$")
+
+
+def unwrap_scalar(value: str) -> str:
+    """Strip one full-value inline-code wrapper. Anything else is untouched."""
+    match = _WRAPPED_SCALAR_RE.match(value.strip())
+    if not match:
+        return value
+    inner = match.group("inner").strip()
+    return inner if inner else value
+
 
 def parse_header(text: str) -> HeaderParseResult:
     lines = text.splitlines()
@@ -37,7 +58,7 @@ def parse_header(text: str) -> HeaderParseResult:
         if not match:
             return HeaderParseResult(False, "malformed-header-line", fields)
         key = match.group(1).strip().lower()
-        value = match.group(2).strip()
+        value = unwrap_scalar(match.group(2).strip())
         if key in CRITICAL_HEADER_FIELDS and key in fields:
             return HeaderParseResult(False, f"duplicate-critical-header-field:{key}", fields)
         if key not in fields:
