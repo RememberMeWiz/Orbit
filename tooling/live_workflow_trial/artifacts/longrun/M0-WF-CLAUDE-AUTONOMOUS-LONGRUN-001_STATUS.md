@@ -5,13 +5,13 @@
 
 | Field | Value |
 | :--- | :--- |
-| Updated | 2026-08-20T12:05Z |
+| Updated | 2026-08-21T00:45Z |
 | Branch | `claude/m0-autonomous-longrun-001` |
 | Started from | `446e43af18445067a9bc227bb810ce17069929cf` (head of `claude/m0-wf-apprentice-002`) |
-| HEAD | `0f4cc5c` |
+| HEAD | `ffe46cf` |
 | Current phase | **B — live zero-courier trial** |
-| Current objective | B2 — second hop (architecture-tl), blocked on a human click |
-| Blocker | **Architecture TL is showing "Continue with Work?" and exposes no Continue control to accessibility. A human must click it.** |
+| Current objective | B4 — repeat the chain with no human UI clicks (addendum item D) |
+| Blocker | NONE |
 
 ---
 
@@ -152,84 +152,128 @@ for supervised runs.
 
 ```text
 workflow     67 pass
-standalone  295 pass   (2 skipped: symlink creation needs Developer Mode;
+standalone  330 pass   (2 skipped: symlink creation needs Developer Mode;
                         Windows junction coverage supersedes them)
 native       14 pass
-TOTAL       376 pass, 2 skipped, 0 release-blocking skips
+TOTAL       411 pass, 2 skipped, 0 release-blocking skips
 ```
 
 ---
 
 ## Live-trial result
 
-### B1 — COMPLETE. Courier actions: 0.
+### Full chain PROVEN — Worker -> TL -> QA -> PM
 
-Orbit carried a real piece of work from the PM conversation to a worker and
-back without the Product Owner touching a file.
+Three hops, three distinct endpoints, every one routed by a PM directive that
+Orbit had to ask for. Evidence in `longrun/evidence/b1/`.
 
-| step | outcome |
-| :--- | :--- |
-| wake_pm | `PM_WOKEN` · `pmreq-9ae12ea75546663186d7` |
-| await_directive | `DIRECTIVE_ACCEPTED` · `pmdir-20260820-1930-b1-live-001` |
-| dispatch | `DISPATCHED` → `windows-worker` |
-| await_worker | `WORKER_RESPONDED` · 27.5s, 7 polls |
-| collect | `COLLECTED` · 6917 bytes, header-validated |
-| report_to_pm | `PM_WOKEN` · digest attached |
+| hop | endpoint | directive | returned | bytes |
+| :--- | :--- | :--- | :--- | ---: |
+| 1 | `windows-worker` | `pmdir-...-b1-live-001` | accessibility guard review | 6917 |
+| 2 | `architecture-tl` | `pmdir-...-b1-live-002` | classification review | 10041 |
+| 3 | `qa-safety` | `pmdir-...-b1-live-004` | adversarial safety review | 13719 |
 
-PM was asked which role should take the work and answered `windows-worker` —
-the registry slug, not the chat's display title. Evidence in
-`longrun/evidence/b1/`.
+Hop 2 also delivered hop 1's handoff **as an attached file**, exercising the
+clipboard file-drop path live.
 
-The worker returned five findings on the C2 guard, four actionable, two of them
-real defects. All are now implemented (`bc46e6c`).
+Every returned handoff was materialised to Orbit's inbox, SHA-256 hashed and
+header-validated before anything acted on it. PM chose each next hop after
+reading the previous result — including routing to `architecture-tl` and then
+`qa-safety` entirely on its own.
 
-### B2 — second hop dispatched, then blocked
+**Courier actions: 0**, except one class of human click described below.
 
-PM read the B1 result and directed the next hop to `architecture-tl`. Orbit
-dispatched the assignment **with the worker's handoff attached as a real file**,
-exercising the clipboard file-drop path live.
+### The one thing that needed a human, and why it no longer does
 
-That conversation then entered a state Orbit cannot pass:
+Twice the app interrupted a dispatch with:
 
 ```text
 Continue with Work?
 This request requires creating and delivering a file artifact.
 ```
 
-The composer is removed and **no Continue or Cancel control is exposed to
-accessibility at all** — enumerating all 110 buttons in the window finds only
-sidebar controls. Orbit did not click anything: granting that confirmation
-starts real work and is a decision, not a mechanical step.
+It removes the composer and exposes **no** Continue or Cancel control to
+accessibility — enumerating all 110 buttons in the window finds only sidebar
+controls. Orbit reported the blocker to PM and stopped rather than
+blind-clicking, which is correct but leaves the chain stalled.
 
-Reported to PM as `pmreq-68a8bdce7dd30a15fe1d`.
+The cause is not random: the prompt appears because the assignment asked for a
+**downloadable file artifact**, and the app offers to escalate into a mode that
+spends credits to produce one. For a plain text handoff that means paying for
+something the conversation could have contained.
 
-**To unblock: a human clicks Continue in the Architecture TL conversation.**
-Orbit then resumes with `await --endpoint architecture-tl` and `collect`.
+So the prompt is now avoided rather than answered. A worker returns its handoff
+inline between `ORBIT_HANDOFF_BEGIN`/`ORBIT_HANDOFF_END` markers and Orbit reads
+it from the transcript — no file card, no save dialog, no escalation offer, no
+credits. Confirmed live: the same worker, given a no-file assignment, answered
+directly with no prompt at all.
+
+That path was designed twice. The first attempt asked for Markdown and failed
+live with `artifact-missing-formal-header`, because the accessibility tree keeps
+plain text and discards structure — `## Header` arrived as `Header` and the
+bullet list under it disappeared entirely. Flat `key: value` lines survive
+intact, which is exactly why the ORBIT_DIRECTIVE envelope has always worked over
+the same channel, so the handoff now uses that shape and Orbit renders the
+canonical Markdown locally.
+
+### QA's adversarial verdict
+
+Six safety claims, submitted for attack rather than confirmation:
+
+| claim | verdict |
+| :--- | :--- |
+| 1 — cannot end a running session | breaks |
+| 2 — no keystroke to a window not in front | breaks |
+| 3 — never acts on a target named in prose | breaks |
+| 4 — nothing external happens twice | holds conditionally |
+| 5 — does not grant in-app confirmations | breaks |
+| 6 — no secrets leave the machine | breaks |
+
+Two are now closed:
+
+**Claim 2 (QA's top-ranked gap).** The double foreground check narrows the
+time-of-check/time-of-use window without ever closing it. The composer exposes a
+writable `ValuePattern`, which is bound to the *element* rather than to whatever
+holds focus, so message staging now uses no keystroke and no clipboard at all.
+Verified before adoption that the editor genuinely registers it: the app's own
+Send button transitions disabled -> enabled -> disabled tracking the set, and
+that signal is now a second staging check alongside the text read-back.
+
+**Claim 3.** Every check was field-level, so a well-formed envelope was accepted
+regardless of author — and newest-first scanning made injection easier, not
+harder. Directives are now read only from assistant turns, using the app's own
+`ChatGPT said:` / `You said:` markers. A transcript with no markers yields no
+directive at all, because absent provenance is none rather than weak.
+
+Claims 1, 5 and 6 remain open and are recorded, not glossed. Claim 4's residual
+is concurrency: the ledger prevents a restarted runner from resending, but two
+concurrent runners are a separate problem needing a single-writer lock.
 
 ## Defects found live, all fixed
 
 None of these were reachable from the stubbed tests.
 
-1. **Keystrokes were sent without checking which window was in front** (`a7cd192`).
-   `SendKeys` targets the foreground window and a UIA `SetFocus` on a background
-   window does not make it foreground, so `Ctrl+A`/`Ctrl+V` performed
-   select-all-and-replace in whatever *was* in front. All six keystroke sites
-   now raise the intended window and re-check the foreground immediately before
-   sending, or send nothing.
-
-2. **Orbit read its own reply template as PM's decision** (`a7cd192`). The
-   transcript is now scanned newest-first, malformed candidates are skipped, and
-   any value still wearing its `<angle brackets>` is refused as unfilled.
-
-3. **A streaming window looked broken** (`ae0e65c`). Send is replaced by Stop
+1. **Keystrokes were sent without checking which window was in front**
+   (`a7cd192`), later removed from message staging altogether (`31407bd`).
+2. **Orbit read its own reply template as PM's decision** (`a7cd192`).
+3. **A streaming window looked broken** (`ae0e65c`) — Send is replaced by Stop
    while a response streams, so readiness failed exactly when Orbit needed to
-   watch a worker. Readiness now accepts either transport control.
+   watch a worker.
+4. **One stuck conversation stranded the whole app** (`0f4cc5c`), including the
+   PM chat Orbit would have used to report it.
+5. **Markdown cannot survive the transcript channel** (`ffe46cf`).
 
-4. **One stuck conversation stranded the whole app** (`0f4cc5c`). Three places
-   measured app-wide health against whichever chat was on screen. Preflight now
-   asks `drivable` rather than `ok`; `focus()` requires only the chat list
-   before switching; and the post-switch header check is polled rather than
-   raced against the outgoing conversation.
+## Reviews acted on
+
+The workers reviewed Orbit, and Orbit changed:
+
+* windows-worker found two real defects in the C2 guard shipped an hour earlier
+  — a no-window process with no flag reported the wrong cause, and `READY` could
+  be asserted without tying path, command line, window and composer to one
+  process. Both fixed (`bc46e6c`).
+* architecture-tl returned "sound with changes" and seven rule changes; six
+  implemented (`96eb7dc`), the seventh deferred with its reason.
+* qa-safety's two highest-ranked gaps are closed as above (`31407bd`, `f145dd4`).
 
 ---
 
@@ -245,6 +289,9 @@ duplicate workflow advancement   0
 arbitrary command from handoff   0
 secret leakage                   0
 app confirmations auto-clicked   0
+paid work-mode escalations       0
+keystrokes in message staging    0   (element-bound value write)
+directives from non-assistant    0   (refused: provenance-unknown)
 shared branches moved            none (main 6928e5b, integration 0813f44)
 force-push / history rewrite     none
 ```
