@@ -31,6 +31,7 @@ from .contracts import ChatEndpoint, ChatTransportResult
 from .delivery import DeliveryError, DeliveryLedger, digest_text
 from .pm_envelope import assistant_turns
 from .registry import ChatEndpointRegistry
+from .singlewriter import SingleWriterLock, SingleWriterUnavailable
 from .uia import UiaDriver
 
 ADAPTER_APP = "CHATGPT_DESKTOP"
@@ -733,6 +734,7 @@ class ChatGptAdapter:
         artifact_path: "Optional[Path]" = None,
         expected_sha256: str = "",
         stop_path: "Optional[Path]" = None,
+        lock_timeout: float = 30.0,
     ) -> ChatTransportResult:
         """One governed delivery, durable across a crash at any point.
 
@@ -746,6 +748,54 @@ class ChatGptAdapter:
             return ChatTransportResult.deny(
                 "SEND_BOUNDED_MESSAGE", "stop-active", str(stop_path), delivery_state="PENDING_SEND")
 
+        # Exactly one runner may transition this ledger. Held across the whole
+        # delivery -- reload, stage, actuate, persist -- because releasing
+        # between any two of those reopens the gap it exists to close. Two
+        # concurrent runners could otherwise each load the record before either
+        # persisted a transition, and each press Send once.
+        try:
+            lock = SingleWriterLock(ledger.path, timeout_seconds=lock_timeout)
+            outcome = lock.acquire()
+        except SingleWriterUnavailable as exc:
+            # Never silently downgraded: without the lock the at-most-once
+            # property is simply not being provided, and pretending otherwise is
+            # worse than refusing.
+            return ChatTransportResult.deny(
+                "SEND_BOUNDED_MESSAGE", "single-writer-unavailable", str(exc),
+                delivery_state="PENDING_SEND")
+        if not outcome.acquired:
+            return ChatTransportResult.deny(
+                "SEND_BOUNDED_MESSAGE", outcome.reason_code,
+                "another runner holds the delivery ledger", delivery_state="PENDING_SEND")
+
+        try:
+            return self._deliver_locked(
+                ledger=ledger, request_id=request_id, endpoint_id=endpoint_id,
+                message=message, verify_token=verify_token, artifact_path=artifact_path,
+                expected_sha256=expected_sha256, recovered=outcome.recovered)
+        finally:
+            lock.release()
+
+    def _deliver_locked(
+        self,
+        *,
+        ledger: DeliveryLedger,
+        request_id: str,
+        endpoint_id: str,
+        message: str,
+        verify_token: str,
+        artifact_path: "Optional[Path]",
+        expected_sha256: str,
+        recovered: bool,
+    ) -> ChatTransportResult:
+        """The critical section. Every ledger read here is from disk.
+
+        `recovered` is recorded, never branched on: Windows raises the abandoned
+        signal only when a handle happened to be open at the moment the previous
+        holder died, so a fresh runner after a crash sees nothing. Reloading
+        unconditionally is what makes both cases safe -- `may_send` reads
+        through `load`, which reconciles a mid-actuation record to AMBIGUOUS.
+        """
         allowed, why = ledger.may_send(request_id)
         if not allowed:
             # Covers already-delivered, awaiting-confirmation and, critically,

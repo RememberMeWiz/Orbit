@@ -22,6 +22,17 @@ A record found in `SEND_ACTUATED` at load time is exactly the uncertain window:
 the click may or may not have landed. It is reconciled to `AMBIGUOUS`, and
 `AMBIGUOUS` never auto-resends — a human decides. Anything still pre-actuation
 is safe to retry, because nothing external happened yet.
+
+What this guarantees, stated as narrowly as it is actually true:
+
+    Orbit guarantees at-most-once local Send actuation per delivery record
+    among participating Orbit runners on the same Windows installation.
+
+It does not guarantee exactly-once *remote* delivery -- the app could duplicate
+a submission internally and Orbit would never know -- and it does not constrain
+a human pressing Send in the same conversation, or any writer that does not
+take the lock in `standalone/bridge/singlewriter.py`. The earlier wording,
+"nothing external happens twice", claimed all three.
 """
 from __future__ import annotations
 

@@ -12,6 +12,7 @@ ordinary restart rather than a special case.
     await      wait for the target conversation to finish responding
     collect    materialise and validate the expected handoff
                (--source transcript avoids the paid work-mode prompt)
+    hop        carry the accepted directive: dispatch, wait, collect, report
     cycle      all of the above as one governed round trip
     clear      remove staged attachments after an abandoned dispatch
 
@@ -186,6 +187,73 @@ def cmd_collect(loop: ApprenticeLoop, args) -> int:
     return emit({"ok": out.action == "COLLECTED", **out.to_dict()})
 
 
+def cmd_hop(loop: ApprenticeLoop, args) -> int:
+    """Carry one already-accepted directive all the way through.
+
+    dispatch -> await -> collect -> report, with no human touching anything in
+    between. Split out from `cycle` because by this point PM has already decided:
+    re-asking would be noise, and re-polling would risk acting on a directive
+    that has since been consumed.
+    """
+    blocked = preflight(loop, args)
+    if blocked:
+        return emit(blocked)
+
+    focused = loop.adapter.focus(loop.pm_endpoint_id)
+    if not focused.ok:
+        return emit({"ok": False, "action": "PM_FOCUS_FAILED", "reason_code": focused.reason_code})
+    tail = loop.adapter.driver.read_transcript_tail(8000)
+    verdict = loop.pm_state.evaluate(str(tail.data.get("text", ""))) if tail.ok else None
+    if verdict is None or not verdict.accepted:
+        return emit({"ok": False, "action": "NO_ACTIVE_DIRECTIVE",
+                     "reason_code": verdict.reason_code if verdict else "transcript-unreadable"})
+
+    directive: PMDirective = verdict.directive
+    steps = [{"step": "directive", "directive": directive.to_dict()}]
+
+    dispatched = loop.dispatch(directive=directive,
+                               assignment=Path(args.assignment).read_text(encoding="utf-8"),
+                               verify_token=args.token,
+                               artifact_path=Path(args.artifact) if args.artifact else None)
+    steps.append({"step": "dispatch", **dispatched.to_dict()})
+    if dispatched.action != "DISPATCHED":
+        return emit({"ok": False, "action": "HOP_FAILED", "stopped_at": "dispatch",
+                     "reason_code": dispatched.reason_code, "steps": steps})
+    loop.record(directive=directive, action=directive.action,
+                state_before={"work_state": "awaiting-dispatch"},
+                state_after={"delivery_state": dispatched.data.get("delivery_state")},
+                evidence={"endpoint": directive.target_endpoint},
+                result="dispatched", classification="success", reason="pm-directed-dispatch")
+    loop.consume(directive)
+
+    focused = loop.adapter.focus(directive.target_endpoint)
+    if not focused.ok:
+        return emit({"ok": False, "action": "HOP_FAILED", "stopped_at": "focus",
+                     "reason_code": focused.reason_code, "steps": steps})
+    responded = loop.await_worker(timeout=args.worker_timeout)
+    steps.append({"step": "await_worker", **responded.to_dict()})
+    if responded.action != "WORKER_RESPONDED":
+        return emit({"ok": False, "action": "HOP_FAILED", "stopped_at": "await_worker",
+                     "reason_code": responded.reason_code, "steps": steps})
+
+    collected = loop.collect(endpoint_id=directive.target_endpoint, expected_name=args.expect,
+                             expected_sender=args.sender, source=args.source)
+    steps.append({"step": "collect", **collected.to_dict()})
+    if collected.action != "COLLECTED":
+        return emit({"ok": False, "action": "HOP_FAILED", "stopped_at": "collect",
+                     "reason_code": collected.reason_code, "steps": steps})
+
+    reported = loop.report_to_pm(
+        summary=args.summary or f"{args.expect} collected and validated",
+        nonce=f"{args.nonce}-report",
+        artifact_id=str(collected.data.get("filename", args.expect)),
+        artifact_digest=str(collected.data.get("sha256", "")))
+    steps.append({"step": "report_to_pm", **reported.to_dict()})
+    return emit({"ok": reported.action == "PM_WOKEN", "action": "HOP_COMPLETE",
+                 "endpoint": directive.target_endpoint,
+                 "artifact": dict(collected.data), "steps": steps})
+
+
 def cmd_cycle(loop: ApprenticeLoop, args) -> int:
     """One full zero-courier round trip, PM decision included."""
     cycle = RoundTrip(
@@ -271,6 +339,19 @@ def main(argv=None) -> int:
     cycle.add_argument("--pm-timeout", type=float, default=1800.0)
     cycle.add_argument("--worker-timeout", type=float, default=1800.0)
     cycle.set_defaults(func=cmd_cycle)
+
+    hop = sub.add_parser("hop", help="carry the accepted directive dispatch->collect->report")
+    hop.add_argument("--assignment", required=True)
+    hop.add_argument("--token", required=True)
+    hop.add_argument("--expect", required=True)
+    hop.add_argument("--nonce", required=True)
+    hop.add_argument("--artifact", default="")
+    hop.add_argument("--sender", default="")
+    hop.add_argument("--summary", default="")
+    hop.add_argument("--source", choices=("file", "transcript"), default="transcript",
+                     help="transcript by default: it never triggers the paid work-mode prompt")
+    hop.add_argument("--worker-timeout", type=float, default=1800.0)
+    hop.set_defaults(func=cmd_hop)
 
     sub.add_parser("clear").set_defaults(func=cmd_clear)
 
