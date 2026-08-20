@@ -747,6 +747,30 @@ switch ($Operation) {
     Done @{ removed = $removed; remaining = $left }
   }
 
+  # Read-only enumeration of control names by type. Strictly diagnostic: it
+  # names things, it cannot touch them. Added because a blocking overlay
+  # replaces the composer with controls Orbit has no name for, and guessing
+  # candidate names one at a time is how you end up activating the wrong one.
+  "list_controls" {
+    $w = Get-ChatWindow
+    $wanted = [string]$P.control_type
+    $limit = 200
+    if ($P.limit) { $limit = [int]$P.limit }
+
+    $names = @()
+    $seen = @{}
+    foreach ($e in (All-Descendants $w)) {
+      if ($wanted -and (CT $e) -ne $wanted) { continue }
+      $n = NM $e
+      if (-not $n) { continue }
+      if ($seen.ContainsKey($n)) { continue }
+      $seen[$n] = $true
+      $names += $n
+      if ($names.Count -ge $limit) { break }
+    }
+    Done @{ control_type = $wanted; names = $names; count = $names.Count }
+  }
+
   # Read-only introspection of one named control. Used to discover which
   # activation pattern a control actually supports instead of assuming, since
   # this app renders otherwise-identical controls with different patterns.

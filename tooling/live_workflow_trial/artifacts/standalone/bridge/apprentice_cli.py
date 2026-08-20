@@ -70,7 +70,9 @@ def preflight(loop: ApprenticeLoop, args) -> Dict[str, Any]:
     with its remedy instead of surfacing as a driver error further in.
     """
     outcome = AccessibilityGuard(loop.adapter.driver).ensure(allow_launch=not args.no_launch)
-    if outcome.ok:
+    # `drivable`, not `ok`: every verb focuses the endpoint it needs, so a
+    # conversation stuck behind a prompt must not block reaching a different one.
+    if outcome.drivable:
         return {}
     return {"ok": False, "action": "SURFACE_UNAVAILABLE", **outcome.to_dict()}
 

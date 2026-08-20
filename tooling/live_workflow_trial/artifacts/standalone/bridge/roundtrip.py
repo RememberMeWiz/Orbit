@@ -94,6 +94,27 @@ class RoundTrip:
             result.reason_code = str(payload.get("reason_code") or payload.get("action", ""))
         return advanced
 
+    def _report_blocker(self, result: CycleResult, nonce: str) -> None:
+        """Tell PM where the cycle stopped, once work is already in flight.
+
+        Only after a dispatch. Before that nothing has happened that PM needs to
+        know about, and an unattended run that failed to even ask its question
+        should not start announcing things. After a dispatch a worker is holding
+        real work, so silence would leave it stranded with nobody aware.
+
+        Best-effort by design: the blocker is usually *the surface*, so the
+        report may well fail too. It is journalled either way, which is what
+        makes the stall visible afterwards.
+        """
+        try:
+            outcome = self.loop.report_to_pm(
+                summary=(f"BLOCKED at {result.stopped_at}: {result.reason_code}. "
+                         "Work is already dispatched. Human action may be required."),
+                nonce=f"{nonce}-blocked-{result.stopped_at}")
+        except Exception as exc:                      # never mask the real failure
+            outcome = LoopOutcome("BLOCKER_REPORT_FAILED", type(exc).__name__, str(exc)[:200])
+        result.steps.append(self._note("report_blocker", outcome.to_dict()))
+
     # -- the cycle -------------------------------------------------------
 
     def run(
@@ -114,7 +135,7 @@ class RoundTrip:
 
         surface = self.guard.ensure(allow_launch=self.allow_launch)
         result.steps.append(self._note("preflight", surface.to_dict()))
-        if not surface.ok:
+        if not surface.drivable:
             result.stopped_at = "preflight"
             result.reason_code = surface.reason_code
             return result
@@ -148,6 +169,7 @@ class RoundTrip:
         # 4. Wait for the worker. This is the wait a human used to sit through.
         responded = self.loop.await_worker(timeout=worker_timeout)
         if not self._record(result, "await_worker", responded):
+            self._report_blocker(result, nonce)
             return result
 
         # 5. Collect the result and validate it before anyone acts on it.
@@ -155,6 +177,7 @@ class RoundTrip:
                                       expected_name=expected_artifact,
                                       expected_sender=expected_sender)
         if not self._record(result, "collect", collected):
+            self._report_blocker(result, nonce)
             return result
         result.artifact = dict(collected.data)
 

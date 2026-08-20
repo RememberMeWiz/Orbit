@@ -278,6 +278,38 @@ class EnsureTests(unittest.TestCase):
         self.assertEqual(out.reason_code, "app-untrusted-path")
 
 
+class DrivableTests(unittest.TestCase):
+    """Preflight asks a different question than per-conversation readiness."""
+
+    def test_ACC_040_a_non_chat_view_still_leaves_the_app_drivable(self):
+        """Otherwise one stuck conversation hides every healthy one."""
+        out = guard(FakeDriver([variant(accessibility_ready=False,
+                                        web_content_present=True)])).observe()
+        self.assertFalse(out.ok)
+        self.assertTrue(out.drivable)
+
+    def test_ACC_041_a_ready_surface_is_both(self):
+        out = guard(FakeDriver([RUNNING_READY])).observe()
+        self.assertTrue(out.ok)
+        self.assertTrue(out.drivable)
+
+    def test_ACC_042_genuinely_broken_states_are_not_drivable(self):
+        for state in (variant(accessibility_flag=False, accessibility_ready=False,
+                              web_content_present=False),
+                      variant(session_locked=True),
+                      variant(trusted_path=False),
+                      variant(windowed_count=2, instance_ambiguous=True),
+                      NOT_RUNNING):
+            out = guard(FakeDriver([state])).observe()
+            self.assertFalse(out.drivable, out.reason_code)
+
+    def test_ACC_043_drivability_is_reported_alongside_readiness(self):
+        payload = guard(FakeDriver([variant(accessibility_ready=False,
+                                            web_content_present=True)])).observe().to_dict()
+        self.assertFalse(payload["ok"])
+        self.assertTrue(payload["drivable"])
+
+
 class OutcomeTests(unittest.TestCase):
     def test_ACC_030_outcome_serialises_for_the_status_file(self):
         payload = guard(FakeDriver([RUNNING_READY])).observe().to_dict()

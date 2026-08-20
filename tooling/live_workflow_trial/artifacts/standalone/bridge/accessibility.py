@@ -39,12 +39,28 @@ class GuardOutcome:
 
     @property
     def ok(self) -> bool:
+        """The conversation currently on screen is a usable chat."""
         return self.status in (READY, LAUNCHED)
+
+    @property
+    def drivable(self) -> bool:
+        """Orbit can reach and read this app, even if this view is not a chat.
+
+        A separate question from `ok`, and the one a preflight should ask.
+        Readiness is measured against whichever conversation happens to be on
+        screen, so gating the whole app on it means one conversation stuck
+        behind a confirmation prompt or a file preview makes every *other*
+        conversation unreachable -- including the PM chat Orbit would use to
+        report the problem. Focusing a specific endpoint is what decides
+        whether that endpoint is usable, and it fails with its own reason.
+        """
+        return self.ok or self.reason_code in DRIVABLE_REASONS
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "status": self.status,
             "ok": self.ok,
+            "drivable": self.drivable,
             "reason_code": self.reason_code,
             "detail": self.detail,
             "remedy": self.remedy,
@@ -70,6 +86,12 @@ TRANSIENT_REASONS = frozenset({
 # Waiting for a just-launched app to appear is also transient, but only *after*
 # a launch. Before one, "not running" is the signal to start it, not to wait.
 _SETTLE_REASONS = TRANSIENT_REASONS | {"app-not-running"}
+
+# States where the app itself is healthy and readable -- renderer exposed, one
+# unambiguous instance, session unlocked -- and only the conversation on screen
+# is unusable. Switching conversations resolves these, so they must not gate a
+# preflight; see GuardOutcome.drivable.
+DRIVABLE_REASONS = frozenset({"composer-not-present"})
 
 
 class AccessibilityGuard:
@@ -152,8 +174,11 @@ class AccessibilityGuard:
         # a modal, an update screen. Restarting would not produce a composer, and
         # would cost the human whatever is on screen.
         if state.get("web_content_present"):
-            return GuardOutcome(UNAVAILABLE, "composer-not-present", state=state,
-                                remedy="Open a conversation in ChatGPT. No restart needed.")
+            return GuardOutcome(
+                UNAVAILABLE, "composer-not-present", state=state,
+                remedy="Open a conversation in ChatGPT, or dismiss whatever is covering "
+                       "the composer — a file preview, a modal, or an in-conversation "
+                       "confirmation prompt. No restart needed.")
 
         # Flag present, no web content at all: the renderer really is opaque.
         # Still may be a window mid-construction, so `ensure` re-observes before

@@ -206,6 +206,42 @@ class FocusTests(unittest.TestCase):
         self.assertTrue(result.ok)
         self.assertEqual(result.data["active_chat_title"], "Orbit PM")
 
+    def test_CHAT_002_a_stuck_chat_does_not_block_switching_away_from_it(self):
+        """The chat currently shown may be behind a prompt; that is why we switch."""
+        class Stuck(StubDriver):
+            def __init__(self):
+                super().__init__()
+                # No composer until the switch happens.
+                self.surface = {**self.surface, "composer_present": False,
+                                "send_present": False, "attach_present": False}
+
+            def focus_chat(self, *, chat_list_name, chat_title):
+                result = super().focus_chat(chat_list_name=chat_list_name, chat_title=chat_title)
+                self.surface = {**self.surface, "composer_present": True,
+                                "send_present": True, "attach_present": True}
+                return result
+
+        result = build(Stuck()).focus("orbit-pm")
+        self.assertTrue(result.ok, result.reason_code)
+        self.assertEqual(result.data["active_chat_title"], "Orbit PM")
+
+    def test_CHAT_002b_an_unreadable_chat_list_still_blocks_the_switch(self):
+        driver = StubDriver()
+        driver.surface = {**driver.surface, "chat_items": []}
+        result = build(driver).focus("orbit-pm")
+        self.assertFalse(result.ok)
+        self.assertEqual(result.reason_code, "chat-list-not-ready-in-time")
+        self.assertNotIn("focus_chat:Orbit PM", driver.calls)
+
+    def test_CHAT_002c_the_destination_must_still_have_a_composer(self):
+        """Switching away from a stuck chat into another stuck chat is not success."""
+        driver = StubDriver()
+        driver.surface = {**driver.surface, "composer_present": False,
+                          "send_present": False, "attach_present": False}
+        result = build(driver).focus("orbit-pm")
+        self.assertFalse(result.ok)
+        self.assertEqual(result.reason_code, "surface-not-ready-in-time")
+
     def test_CHAT_003_header_disagreement_fails_closed(self):
         class Wrong(StubDriver):
             def focus_chat(self, *, chat_list_name, chat_title):

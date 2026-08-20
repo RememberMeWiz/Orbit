@@ -316,7 +316,11 @@ class HaltTests(CycleBase):
         result = self.run_cycle()
         self.assertEqual(result.stopped_at, "collect")
         self.assertIsNone(result.artifact)
-        self.assertEqual(self.driver.calls.count("press_send"), 2)   # wake + dispatch, no report
+        self.assertFalse(result.completed)
+        # PM is told, but told the truth: a blocker, never a delivered artifact.
+        report = self.driver.sent_messages[-1]
+        self.assertIn("BLOCKED at collect", report)
+        self.assertNotIn("artifact_sha256", report)
 
     def test_RT_034_a_worker_that_never_finishes_stops_before_collecting(self):
         self.driver.worker_hangs = True
@@ -337,6 +341,55 @@ class HaltTests(CycleBase):
         result = self.run_cycle()
         self.assertEqual(result.stopped_at, "wake_pm")
         self.assertIsNone(self.make_loop().pm_state.load()["pending_request"])
+
+
+class BlockerReportTests(CycleBase):
+    """Once work is in flight, a stall must not be silent."""
+
+    def test_RT_050_a_stalled_worker_is_reported_to_pm(self):
+        self.driver.worker_hangs = True
+        result = self.run_cycle()
+        self.assertEqual(result.stopped_at, "await_worker")
+        self.assertEqual(result.steps[-1]["step"], "report_blocker")
+        self.assertIn("BLOCKED at await_worker", self.driver.sent_messages[-1])
+
+    def test_RT_051_a_failed_collection_is_reported_to_pm(self):
+        self.driver.artifact_name = "SOMETHING_ELSE.md"
+        result = self.run_cycle()
+        self.assertEqual(result.stopped_at, "collect")
+        self.assertEqual(result.steps[-1]["step"], "report_blocker")
+
+    def test_RT_052_nothing_is_announced_before_work_is_dispatched(self):
+        """A cycle that never asked its question should not start reporting."""
+        self.driver.directive_text = "sure, go ahead"
+        result = self.run_cycle()
+        self.assertEqual(result.stopped_at, "await_directive")
+        self.assertNotIn("report_blocker", [s["step"] for s in result.steps])
+
+    def test_RT_053_a_blocked_surface_reports_nothing_at_all(self):
+        from standalone.bridge.accessibility import NEEDS_HUMAN_RESTART
+
+        self.guard.outcome = GuardOutcome(NEEDS_HUMAN_RESTART, "accessibility-flag-absent")
+        result = self.run_cycle()
+        self.assertNotIn("report_blocker", [s["step"] for s in result.steps])
+        self.assertNotIn("press_send", self.driver.calls)
+
+    def test_RT_054_a_report_that_itself_fails_is_journalled_not_raised(self):
+        """The blocker is usually the surface, so the report often fails too."""
+        self.driver.worker_hangs = True
+
+        loop = self.make_loop()
+        original = loop.report_to_pm
+        loop.report_to_pm = lambda **kw: (_ for _ in ()).throw(RuntimeError("surface gone"))
+        cycle = RoundTrip(loop, journal_path=self.journal, guard=self.guard)
+        result = cycle.run(reason="r", nonce="n", assignment=f"{TOKEN} x",
+                           verify_token=TOKEN, expected_artifact=ARTIFACT,
+                           pm_timeout=60.0, worker_timeout=60.0)
+        self.assertEqual(result.stopped_at, "await_worker")
+        last = result.steps[-1]
+        self.assertEqual(last["step"], "report_blocker")
+        self.assertEqual(last["action"], "BLOCKER_REPORT_FAILED")
+        self.assertEqual(original.__name__, "report_to_pm")
 
 
 class GuardIntegrationTests(CycleBase):

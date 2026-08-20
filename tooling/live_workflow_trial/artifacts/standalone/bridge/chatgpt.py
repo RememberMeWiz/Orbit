@@ -99,6 +99,58 @@ class ChatGptAdapter:
             return ChatTransportResult.deny("FOCUS_REGISTERED_CHAT", "chat-list-empty", self.chat_list_name)
         return ChatTransportResult.allow("FOCUS_REGISTERED_CHAT", dict(data))
 
+    def _await_active_chat(self, title: str, *, timeout: float = 20.0) -> ChatTransportResult:
+        """Wait for the header to name the chat we asked for.
+
+        A click that succeeded but landed elsewhere is still a failure, and so
+        is one that has not taken effect yet. Both look the same at the instant
+        of the click, so this distinguishes them by waiting.
+        """
+        started = self._now()
+        shown = ""
+        while True:
+            active = self.driver.active_chat()
+            if not active.ok:
+                return ChatTransportResult.deny("FOCUS_REGISTERED_CHAT", active.reason_code)
+            shown = str(active.data.get("active_chat_title", ""))
+            if shown == title:
+                return ChatTransportResult.allow("FOCUS_REGISTERED_CHAT", dict(active.data))
+            if (self._now() - started) >= timeout:
+                return ChatTransportResult.deny(
+                    "FOCUS_REGISTERED_CHAT", "focus-verification-failed",
+                    f"expected {title!r}, header shows {shown!r}")
+            self._sleep(1.0)
+
+    def chat_list_ready(self) -> ChatTransportResult:
+        """Enough of the app to select a conversation, and nothing more.
+
+        Deliberately weaker than `surface_ready`: it asks only whether the list
+        of conversations can be read, because that is all a switch needs. Kept
+        separate rather than folded in, so nothing that *sends* can accidentally
+        satisfy itself with this.
+        """
+        snap = self.driver.snapshot(chat_list_name=self.chat_list_name)
+        if not snap.ok:
+            return ChatTransportResult.deny("FOCUS_REGISTERED_CHAT", snap.reason_code,
+                                            str(snap.get("detail", "")))
+        if not snap.data.get("chat_items"):
+            return ChatTransportResult.deny("FOCUS_REGISTERED_CHAT", "chat-list-empty",
+                                            self.chat_list_name)
+        return ChatTransportResult.allow("FOCUS_REGISTERED_CHAT", dict(snap.data))
+
+    def await_chat_list(self, *, timeout: float = 20.0) -> ChatTransportResult:
+        started = self._now()
+        last = ChatTransportResult.deny("FOCUS_REGISTERED_CHAT", "chat-list-never-ready")
+        while True:
+            last = self.chat_list_ready()
+            if last.ok:
+                return last
+            if (self._now() - started) >= timeout:
+                return ChatTransportResult.deny(
+                    "FOCUS_REGISTERED_CHAT", "chat-list-not-ready-in-time",
+                    f"{last.reason_code}: {last.detail}")
+            self._sleep(1.0)
+
     def await_surface(self, *, timeout: float = 20.0) -> ChatTransportResult:
         """Wait for the app to finish rendering, rather than sleeping a guess.
 
@@ -134,7 +186,12 @@ class ChatGptAdapter:
         )
 
     def focus(self, endpoint_id: str) -> ChatTransportResult:
-        ready = self.await_surface()
+        # The precondition for *switching* is the chat list, not the composer.
+        # Requiring a usable composer first meant a conversation stuck behind a
+        # confirmation prompt or a file preview blocked switching away from
+        # itself -- and switching away is precisely the recovery. The composer
+        # is still required afterwards, on the destination, where it matters.
+        ready = self.await_chat_list()
         if not ready.ok:
             return ready
         try:
@@ -146,21 +203,20 @@ class ChatGptAdapter:
         if not result.ok:
             return ChatTransportResult.deny("FOCUS_REGISTERED_CHAT", result.reason_code, str(result.get("detail", "")))
 
+        # Post-condition: the app must say it is showing that chat. Polled
+        # rather than read once, because a surface check alone is satisfied by
+        # the *outgoing* conversation -- its composer is still on screen while
+        # the new one renders, so a single read races the switch and reports the
+        # chat we just left.
+        active = self._await_active_chat(endpoint.display_title)
+        if not active.ok:
+            return active
+        shown = str(active.data.get("active_chat_title", ""))
+
+        # Only now does the destination itself have to be usable.
         settled = self.await_surface()
         if not settled.ok:
             return settled
-
-        # Post-condition: the app must now say it is showing that chat. A click
-        # that "succeeded" but landed elsewhere is caught here, before anything
-        # is typed or sent.
-        active = self.driver.active_chat()
-        if not active.ok:
-            return ChatTransportResult.deny("FOCUS_REGISTERED_CHAT", active.reason_code)
-        shown = str(active.data.get("active_chat_title", ""))
-        if shown != endpoint.display_title:
-            return ChatTransportResult.deny(
-                "FOCUS_REGISTERED_CHAT", "focus-verification-failed",
-                f"expected {endpoint.display_title!r}, header shows {shown!r}")
 
         return ChatTransportResult.allow("FOCUS_REGISTERED_CHAT", {
             "endpoint_id": endpoint.endpoint_id,
