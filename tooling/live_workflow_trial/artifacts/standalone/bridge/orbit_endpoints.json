@@ -1,0 +1,87 @@
+{
+  "schema_version": "orbit.chat-endpoint-registry/0.1-draft",
+  "_note": "Trusted endpoint configuration for the Orbit project chats. endpoint_id is the canonical role slug; display_title is the title observed in the project chat list. Keeping them separate lets PM address roles by slug while Orbit still matches the real UI. Registration is not permission: only entries with enabled=true may be delivered to.",
+  "project_scope": "Orbit",
+  "workflow_scope": "orbit-m0-live-trial",
+  "chat_list_name": "Chats in Yong 2",
+  "agent_endpoint_registry": {},
+  "endpoints": {
+    "orbit-pm": {
+      "endpoint_id": "orbit-pm",
+      "role_id": "PM",
+      "app": "CHATGPT_DESKTOP",
+      "conversation_identity": "Chats in Yong 2/Orbit PM",
+      "display_title": "Orbit PM",
+      "project_scope": "Orbit",
+      "workflow_scope": "orbit-m0-live-trial",
+      "enabled": true,
+      "verification_anchor": "Orbit PM"
+    },
+    "windows-worker": {
+      "endpoint_id": "windows-worker",
+      "role_id": "WORKER",
+      "app": "CHATGPT_DESKTOP",
+      "conversation_identity": "Chats in Yong 2/Windows Workflow",
+      "display_title": "Windows Workflow",
+      "project_scope": "Orbit",
+      "workflow_scope": "orbit-m0-live-trial",
+      "enabled": true,
+      "verification_anchor": "Windows Workflow"
+    },
+    "architecture-tl": {
+      "endpoint_id": "architecture-tl",
+      "role_id": "TL",
+      "app": "CHATGPT_DESKTOP",
+      "conversation_identity": "Chats in Yong 2/Architecture TL",
+      "display_title": "Architecture TL",
+      "project_scope": "Orbit",
+      "workflow_scope": "orbit-m0-live-trial",
+      "enabled": true,
+      "verification_anchor": "Architecture TL"
+    },
+    "qa-safety": {
+      "endpoint_id": "qa-safety",
+      "role_id": "QA",
+      "app": "CHATGPT_DESKTOP",
+      "conversation_identity": "Chats in Yong 2/QA TL",
+      "display_title": "QA TL",
+      "project_scope": "Orbit",
+      "workflow_scope": "orbit-m0-live-trial",
+      "enabled": true,
+      "verification_anchor": "QA TL"
+    },
+    "product-research": {
+      "endpoint_id": "product-research",
+      "role_id": "RESEARCH",
+      "app": "CHATGPT_DESKTOP",
+      "conversation_identity": "Chats in Yong 2/Product Research",
+      "display_title": "Product Research",
+      "project_scope": "Orbit",
+      "workflow_scope": "orbit-m0-live-trial",
+      "enabled": true,
+      "verification_anchor": "Product Research"
+    },
+    "android-worker": {
+      "endpoint_id": "android-worker",
+      "role_id": "WORKER",
+      "app": "CHATGPT_DESKTOP",
+      "conversation_identity": "Chats in Yong 2/Android Worker",
+      "display_title": "Android Worker",
+      "project_scope": "Orbit",
+      "workflow_scope": "orbit-m0-live-trial",
+      "enabled": false,
+      "verification_anchor": "Android Worker"
+    },
+    "memory-worker": {
+      "endpoint_id": "memory-worker",
+      "role_id": "WORKER",
+      "app": "CHATGPT_DESKTOP",
+      "conversation_identity": "Chats in Yong 2/Memory Worker",
+      "display_title": "Memory Worker",
+      "project_scope": "Orbit",
+      "workflow_scope": "orbit-m0-live-trial",
+      "enabled": false,
+      "verification_anchor": "Memory Worker"
+    }
+  }
+}

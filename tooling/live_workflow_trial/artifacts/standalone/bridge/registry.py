@@ -61,6 +61,17 @@ class ChatEndpointRegistry:
     # -- persistence -----------------------------------------------------
 
     @classmethod
+    def from_orbit_config(cls, path: Optional[Path] = None) -> "ChatEndpointRegistry":
+        """Load the committed Orbit endpoint configuration.
+
+        Kept as data rather than code so adding a role chat is a reviewable
+        config change, and so the enabled flag is visible at a glance:
+        registration is not permission.
+        """
+        target = Path(path) if path else Path(__file__).with_name("orbit_endpoints.json")
+        return cls.load(target)
+
+    @classmethod
     def load(cls, path: Path) -> "ChatEndpointRegistry":
         if not Path(path).exists():
             return cls(())
