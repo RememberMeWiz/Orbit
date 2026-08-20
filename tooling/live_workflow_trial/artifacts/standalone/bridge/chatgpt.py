@@ -78,10 +78,17 @@ class ChatGptAdapter:
         if not snap.ok:
             return ChatTransportResult.deny("FOCUS_REGISTERED_CHAT", snap.reason_code, str(snap.get("detail", "")))
         data = snap.data
+        # Send is replaced by Stop for as long as a response is streaming, so
+        # requiring Send specifically made a *working* window look broken the
+        # moment a worker started answering -- exactly when Orbit needs to watch
+        # it. Readiness asks whether the transport control exists in either of
+        # its two forms; whether it is safe to send right now is a separate
+        # question, answered by response_state at the point of sending.
+        transport = bool(data.get("send_present")) or bool(data.get("stop_present"))
         missing = [
             name for name, present in (
                 ("composer", data.get("composer_present")),
-                ("send", data.get("send_present")),
+                ("transport", transport),
                 ("attach", data.get("attach_present")),
             ) if not present
         ]

@@ -162,6 +162,33 @@ class SurfaceTests(unittest.TestCase):
         self.assertEqual(obs.state, "error")
         self.assertEqual(obs.detail, "chat-window-unavailable")
 
+    def test_A11Y_006_a_streaming_window_is_ready_not_broken(self):
+        """Send is replaced by Stop mid-response; the window is still usable."""
+        driver = StubDriver()
+        driver.surface = {**driver.surface, "send_present": False, "stop_present": True}
+        result = build(driver).surface_ready()
+        self.assertTrue(result.ok, result.reason_code)
+
+    def test_A11Y_007_no_transport_control_at_all_denies(self):
+        driver = StubDriver()
+        driver.surface = {**driver.surface, "send_present": False, "stop_present": False}
+        result = build(driver).surface_ready()
+        self.assertFalse(result.ok)
+        self.assertEqual(result.reason_code, "semantic-surface-incomplete")
+        self.assertIn("transport", result.detail)
+
+    def test_A11Y_008_readiness_does_not_imply_it_is_safe_to_send(self):
+        """The two questions stay separate: send re-checks streaming itself."""
+        driver = StubDriver()
+        driver.surface = {**driver.surface, "send_present": False, "stop_present": True}
+        driver.state_sequence = ["streaming"]
+        adapter = build(driver)
+        self.assertTrue(adapter.surface_ready().ok)
+        adapter.composer_text = "x"
+        result = adapter.send(expect_endpoint_id="orbit-pm")
+        self.assertFalse(result.ok)
+        self.assertEqual(result.reason_code, "response-in-progress")
+
     def test_A11Y_005_app_absent_denies(self):
         class Absent(StubDriver):
             def snapshot(self, chat_list_name=""):

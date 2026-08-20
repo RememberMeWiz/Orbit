@@ -224,7 +224,7 @@ switch ($Operation) {
     $all = All-Descendants $w
     $listName = if ($P.chat_list_name) { $P.chat_list_name } else { "" }
 
-    $composer = $null; $send = $null; $attach = $null; $doc = $null
+    $composer = $null; $send = $null; $attach = $null; $doc = $null; $stop = $null
     $chatItems = @(); $headerChat = ""
     $counts = @{}
 
@@ -233,6 +233,9 @@ switch ($Operation) {
       if ($counts.ContainsKey($t)) { $counts[$t]++ } else { $counts[$t] = 1 }
       if ($t -eq "Edit" -and $c -like "*ProseMirror*") { $composer = $n }
       if ($t -eq "Button" -and $n -ceq "Send") { $send = $n }
+      # While a response streams, Send is replaced by Stop. Both are reported so
+      # a caller can tell "this window is usable" apart from "this window is idle".
+      if ($t -eq "Button" -and $n -ceq "Stop") { $stop = $n }
       if ($t -eq "Button" -and $n -ceq "Add files and more") { $attach = $n }
       if ($t -eq "Document") { $doc = $n }
     }
@@ -259,6 +262,7 @@ switch ($Operation) {
       composer_present = ($null -ne $composer)
       composer_name = $composer
       send_present = ($null -ne $send)
+      stop_present = ($null -ne $stop)
       attach_present = ($null -ne $attach)
       document_name = $doc
       chat_list_name = $listName
