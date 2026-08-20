@@ -51,6 +51,20 @@ public class OrbitCursor {
 }
 '@
 
+# OpenInputDesktop fails while the workstation is locked or a secure desktop is
+# up. It is the cheapest reliable way to tell "the tree is hidden right now"
+# apart from "the tree was never exposed", which have opposite remedies.
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public class OrbitDesktop {
+    [DllImport("user32.dll", SetLastError=true)]
+    public static extern IntPtr OpenInputDesktop(uint flags, bool inherit, uint access);
+    [DllImport("user32.dll", SetLastError=true)]
+    public static extern bool CloseDesktop(IntPtr h);
+}
+'@
+
 # Declare DPI awareness before any geometry is read or any cursor is moved.
 #
 # This display runs at 125% scaling (1920x1080 physical, 1536x864 reported to a
@@ -775,10 +789,19 @@ switch ($Operation) {
       }
     }
 
+    # Every field below is read from ONE process. Aggregating across processes
+    # would let a trusted-and-flagged background instance lend its credentials
+    # to whichever window happened to be observed, so path, command line, window
+    # handle and composer all come from $proc and nowhere else.
     $proc = if ($windowed) { $windowed | Select-Object -First 1 } else { $procs | Select-Object -First 1 }
     $path = ""
     try { $path = [string]$proc.Path } catch { }
     $trusted = ($path -like "*OpenAI.Codex*")
+
+    # ...and when more than one instance owns a window, picking the first is a
+    # guess. Report the ambiguity instead: the caller must not treat any single
+    # instance's readiness as the app's readiness.
+    $windowedCount = $windowed.Count
 
     # The flag is only observable on the command line. A renderer that was
     # started without it exposes no semantic tree no matter how long we wait.
@@ -786,10 +809,21 @@ switch ($Operation) {
     try { $cmdline = [string](Get-CimInstance Win32_Process -Filter "ProcessId=$($proc.Id)" -ErrorAction Stop).CommandLine } catch { }
     $flagged = ($cmdline -like "*--force-renderer-accessibility*")
 
+    # A locked workstation or an active secure desktop hides the normal UIA tree.
+    # That looks identical to "accessibility failed" from the tree alone, but the
+    # remedy is completely different -- and restarting the app cannot fix it.
+    $locked = $false
+    try {
+      $desk = [OrbitDesktop]::OpenInputDesktop(0, $false, 0x0001)
+      if ($desk -eq [IntPtr]::Zero) { $locked = $true } else { [void][OrbitDesktop]::CloseDesktop($desk) }
+    } catch { }
+
     # Whether the flag took effect is a separate question from whether it was
-    # passed, so it is measured rather than inferred: a composer in the tree is
-    # the smallest proof that renderer accessibility is live.
-    $ready = $false; $descendants = 0
+    # passed, so it is measured rather than inferred. Two distinct measurements:
+    # a Document proves the renderer exposes web content at all, and a composer
+    # proves the current view is a chat. Without the second one the first is what
+    # separates "accessibility is dead" from "this is a settings or sign-in page".
+    $ready = $false; $descendants = 0; $webContent = $false
     if ($windowed -and $trusted) {
       try {
         $el = $UIA::FromHandle($proc.MainWindowHandle)
@@ -797,7 +831,10 @@ switch ($Operation) {
           $all = All-Descendants $el
           $descendants = $all.Count
           foreach ($e in $all) {
-            if ((CT $e) -eq "Edit" -and (ClassOf $e) -like "*ProseMirror*") { $ready = $true; break }
+            $t = CT $e
+            if ($t -eq "Document") { $webContent = $true }
+            if ($t -eq "Edit" -and (ClassOf $e) -like "*ProseMirror*") { $ready = $true }
+            if ($ready -and $webContent) { break }
           }
         }
       } catch { }
@@ -806,9 +843,13 @@ switch ($Operation) {
     Done @{
       running = $true
       windowed = [bool]$windowed
+      windowed_count = $windowedCount
+      instance_ambiguous = ($windowedCount -gt 1)
       trusted_path = $trusted
       accessibility_flag = $flagged
       accessibility_ready = $ready
+      web_content_present = $webContent
+      session_locked = $locked
       descendants = $descendants
       executable = $path
       process_count = $procs.Count

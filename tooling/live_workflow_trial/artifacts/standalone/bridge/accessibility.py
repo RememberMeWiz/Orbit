@@ -57,6 +57,20 @@ RESTART_INSTRUCTION = (
     "manually with --force-renderer-accessibility."
 )
 
+# States that a moment of waiting can legitimately resolve, because the window
+# is still being constructed or the view is still settling. Everything else is
+# reported on the first observation: re-checking a locked session or a missing
+# launch flag only delays telling the human what to do about it.
+TRANSIENT_REASONS = frozenset({
+    "accessibility-not-exposed",
+    "window-not-ready",
+    "composer-not-present",
+})
+
+# Waiting for a just-launched app to appear is also transient, but only *after*
+# a launch. Before one, "not running" is the signal to start it, not to wait.
+_SETTLE_REASONS = TRANSIENT_REASONS | {"app-not-running"}
+
 
 class AccessibilityGuard:
     def __init__(
@@ -75,7 +89,13 @@ class AccessibilityGuard:
     # -- observation -----------------------------------------------------
 
     def observe(self) -> GuardOutcome:
-        """Classify the current app state without changing anything."""
+        """Classify the current app state without changing anything.
+
+        Order matters. The rule throughout is that a state gets reported with
+        its *decisive* cause and the remedy that actually fixes it -- telling a
+        human to restart something a restart cannot repair is worse than saying
+        nothing, because they will do it.
+        """
         result = self.driver.app_state()
         if not result.ok:
             return GuardOutcome(UNAVAILABLE, str(result.get("reason_code", "app-state-failed")),
@@ -85,23 +105,59 @@ class AccessibilityGuard:
         if not state.get("running"):
             return GuardOutcome(UNAVAILABLE, "app-not-running", state=state,
                                 remedy="Orbit can start it.")
+
+        # Checked before anything derived from the UIA tree, because a locked
+        # workstation hides the tree entirely and every downstream conclusion
+        # would be drawn from an observation that could not have succeeded.
+        if state.get("session_locked"):
+            return GuardOutcome(UNAVAILABLE, "interactive-session-unavailable", state=state,
+                                remedy="Unlock the Windows session. Restarting the app will not help.")
+
         if not state.get("trusted_path"):
             # A process named ChatGPT from somewhere else is not our app, and is
             # certainly not something to launch a second copy alongside.
             return GuardOutcome(NEEDS_HUMAN_RESTART, "app-untrusted-path",
                                 detail=str(state.get("executable", "")), state=state,
                                 remedy="Verify which ChatGPT process is running before continuing.")
+
+        # More than one instance owns a window, so "the app" has no single state
+        # to report. Refusing here matches how endpoints resolve: ambiguity is an
+        # error, never a best guess -- and a guess would let one instance's
+        # readiness authorise driving a different one.
+        if state.get("instance_ambiguous"):
+            return GuardOutcome(
+                UNAVAILABLE, "multiple-instance-ambiguous",
+                detail=f"{state.get('windowed_count')} windowed instances", state=state,
+                remedy="Close the extra ChatGPT windows so one instance is unambiguous.")
+
         if not state.get("windowed"):
-            return GuardOutcome(NEEDS_HUMAN_RESTART, "app-has-no-window", state=state,
-                                remedy="Open the ChatGPT window.")
+            # A process with no window *and* no flag is already decided: the flag
+            # cannot be acquired in place, so reporting the missing window would
+            # point at the wrong remedy even though a window may appear later.
+            if not state.get("accessibility_flag"):
+                return GuardOutcome(NEEDS_HUMAN_RESTART, "accessibility-flag-absent", state=state,
+                                    remedy=RESTART_INSTRUCTION)
+            return GuardOutcome(UNAVAILABLE, "window-not-ready", state=state,
+                                remedy="Wait for the ChatGPT window, or open it from the taskbar.")
+
         if state.get("accessibility_ready"):
             return GuardOutcome(READY, "ok", state=state)
+
         if not state.get("accessibility_flag"):
             return GuardOutcome(NEEDS_HUMAN_RESTART, "accessibility-flag-absent", state=state,
                                 remedy=RESTART_INSTRUCTION)
-        # Flag present but no semantic tree: usually the window is still coming
-        # up. Distinguished from the flagless case because it may resolve on its
-        # own, so `ensure` retries this one rather than reporting immediately.
+
+        # Flag present and the renderer is exposing web content, so accessibility
+        # is working -- the visible view simply is not a chat. Sign-in, settings,
+        # a modal, an update screen. Restarting would not produce a composer, and
+        # would cost the human whatever is on screen.
+        if state.get("web_content_present"):
+            return GuardOutcome(UNAVAILABLE, "composer-not-present", state=state,
+                                remedy="Open a conversation in ChatGPT. No restart needed.")
+
+        # Flag present, no web content at all: the renderer really is opaque.
+        # Still may be a window mid-construction, so `ensure` re-observes before
+        # settling on it.
         return GuardOutcome(NEEDS_HUMAN_RESTART, "accessibility-not-exposed", state=state,
                             remedy=RESTART_INSTRUCTION)
 
@@ -113,7 +169,7 @@ class AccessibilityGuard:
         if first.status == READY:
             return first
 
-        if first.reason_code == "accessibility-not-exposed":
+        if first.reason_code in TRANSIENT_REASONS:
             settled = self._settle()
             if settled is not None:
                 return settled
@@ -139,13 +195,15 @@ class AccessibilityGuard:
                             remedy=RESTART_INSTRUCTION)
 
     def _settle(self) -> Optional[GuardOutcome]:
-        """Re-observe a few times; a freshly shown window needs a moment."""
+        """Re-observe a few times; a window mid-construction needs a moment.
+
+        Returns the outcome once it stops being transient, or None if it never
+        does -- in which case the caller reports the original, which is the
+        honest answer: this state persisted.
+        """
         for _ in range(3):
             self._sleep(self.settle_seconds)
             again = self.observe()
-            if again.status == READY:
-                return again
-            if again.reason_code not in ("accessibility-not-exposed", "app-not-running",
-                                         "app-has-no-window"):
+            if again.status == READY or again.reason_code not in _SETTLE_REASONS:
                 return again
         return None
