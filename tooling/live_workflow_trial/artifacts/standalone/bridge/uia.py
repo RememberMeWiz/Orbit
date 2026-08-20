@@ -29,6 +29,7 @@ DRIVER_OPERATIONS = (
     "response_state",
     "press_send",
     "read_transcript_tail",
+    "save_artifact_as",
 )
 
 
@@ -136,3 +137,6 @@ class UiaDriver:
 
     def read_transcript_tail(self, max_chars: int = 6000) -> UiaResult:
         return self.call("read_transcript_tail", {"max_chars": max_chars})
+
+    def save_artifact_as(self, *, filename: str, destination: str) -> UiaResult:
+        return self.call("save_artifact_as", {"filename": filename, "destination": destination})

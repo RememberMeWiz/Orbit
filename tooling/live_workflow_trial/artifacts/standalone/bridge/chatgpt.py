@@ -17,6 +17,13 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
 
+import hashlib
+import io
+import zipfile
+from pathlib import Path
+
+from workflow.core.validation import NAME_RE, parse_header
+
 from .contracts import ChatEndpoint, ChatTransportResult
 from .registry import ChatEndpointRegistry
 from .uia import UiaDriver
@@ -285,3 +292,122 @@ class ChatGptAdapter:
                 "COLLECT_EXPECTED_ARTIFACT", "artifact-ambiguous",
                 f"{len(matches)} cards named {expected_name}")
         return ChatTransportResult.allow("COLLECT_EXPECTED_ARTIFACT", {"filename": matches[0], "candidates": saveable})
+
+    def collect_artifact(
+        self,
+        *,
+        endpoint_id: str,
+        expected_name: str,
+        inbox_dir: "Path",
+        work_item: str,
+        expected_sender: str = "",
+    ) -> ChatTransportResult:
+        """Materialise exactly one expected artifact and validate its identity.
+
+        The destination path is supplied by Orbit, so the file is written where
+        Orbit asked rather than into a shared Downloads folder. There is no
+        window in which a neighbouring file could be mistaken for the result.
+
+        The endpoint is focused and verified first. Collecting from whichever
+        conversation happens to be open would reintroduce the wrong-chat hazard
+        by the back door: the app can change the active chat between a dispatch
+        and a collection, and it was observed doing exactly that.
+        """
+        focused = self.focus(endpoint_id)
+        if not focused.ok:
+            return ChatTransportResult.deny(
+                "COLLECT_EXPECTED_ARTIFACT", focused.reason_code, focused.detail)
+
+        found = self.find_expected_artifact(expected_name)
+        if not found.ok:
+            return found
+
+        match = NAME_RE.match(expected_name)
+        if not match:
+            return ChatTransportResult.deny(
+                "COLLECT_EXPECTED_ARTIFACT", "artifact-name-not-handoff-shaped", expected_name)
+        if match.groupdict()["work"] != work_item:
+            return ChatTransportResult.deny(
+                "COLLECT_EXPECTED_ARTIFACT", "artifact-work-item-mismatch",
+                f"filename declares {match.groupdict()['work']}, expected {work_item}")
+
+        inbox = Path(inbox_dir)
+        inbox.mkdir(parents=True, exist_ok=True)
+        destination = inbox / expected_name
+        if destination.exists():
+            # Never silently overwrite an already-collected artifact; a second
+            # collection has to be an explicit decision.
+            return ChatTransportResult.deny(
+                "COLLECT_EXPECTED_ARTIFACT", "artifact-already-collected", str(destination))
+
+        saved = self.driver.save_artifact_as(filename=expected_name, destination=str(destination))
+        if not saved.ok:
+            return ChatTransportResult.deny(
+                "COLLECT_EXPECTED_ARTIFACT", saved.reason_code, str(saved.get("detail", "")))
+
+        # The dialog closing is not proof the bytes arrived; check the file.
+        for _ in range(10):
+            if destination.is_file() and destination.stat().st_size > 0:
+                break
+            self._sleep(0.5)
+        else:
+            return ChatTransportResult.deny(
+                "COLLECT_EXPECTED_ARTIFACT", "artifact-not-materialised", str(destination))
+
+        data = destination.read_bytes()
+        digest = hashlib.sha256(data).hexdigest()
+
+        # The accepted envelope allows .md or .zip, and a zip carries its header
+        # in a root HANDOFF.md. Mirror the engine's rules rather than inventing
+        # a second, weaker set here.
+        if destination.suffix.lower() == ".zip":
+            try:
+                with zipfile.ZipFile(io.BytesIO(data), "r") as archive:
+                    names = archive.namelist()
+                    if "HANDOFF.md" not in names:
+                        return ChatTransportResult.deny(
+                            "COLLECT_EXPECTED_ARTIFACT", "artifact-zip-missing-root-handoff", str(destination))
+                    for name in names:
+                        normalized = name.replace("\\", "/")
+                        if normalized.startswith("/") or "../" in normalized or normalized == "..":
+                            return ChatTransportResult.deny(
+                                "COLLECT_EXPECTED_ARTIFACT", "artifact-zip-path-traversal", name)
+                        if normalized != "HANDOFF.md" and not normalized.startswith("artifacts/"):
+                            return ChatTransportResult.deny(
+                                "COLLECT_EXPECTED_ARTIFACT", "artifact-zip-unsupported-root-entry", name)
+                    text = archive.read("HANDOFF.md").decode("utf-8")
+            except (zipfile.BadZipFile, UnicodeDecodeError, OSError):
+                return ChatTransportResult.deny("COLLECT_EXPECTED_ARTIFACT", "artifact-malformed-zip", str(destination))
+        else:
+            try:
+                text = data.decode("utf-8")
+            except UnicodeDecodeError:
+                return ChatTransportResult.deny("COLLECT_EXPECTED_ARTIFACT", "artifact-not-utf8", str(destination))
+
+        parsed = parse_header(text)
+        if not parsed.ok:
+            return ChatTransportResult.deny(
+                "COLLECT_EXPECTED_ARTIFACT", f"artifact-{parsed.reason}", str(destination))
+
+        fields = parsed.fields
+        if fields.get("work item") != work_item:
+            return ChatTransportResult.deny(
+                "COLLECT_EXPECTED_ARTIFACT", "artifact-header-work-item-mismatch",
+                f"header declares {fields.get('work item')!r}, expected {work_item!r}")
+        if expected_sender and str(fields.get("from", "")).upper() != expected_sender.upper():
+            return ChatTransportResult.deny(
+                "COLLECT_EXPECTED_ARTIFACT", "artifact-sender-mismatch",
+                f"header declares {fields.get('from')!r}, expected {expected_sender!r}")
+
+        return ChatTransportResult.allow("COLLECT_EXPECTED_ARTIFACT", {
+            "filename": expected_name,
+            "path": str(destination),
+            "sha256": digest,
+            "size_bytes": len(data),
+            "work_item": fields.get("work item"),
+            "sender": fields.get("from"),
+            "recipient": fields.get("to"),
+            "status": fields.get("status"),
+            "handoff_id": fields.get("handoff id"),
+            "sequence": fields.get("sequence"),
+        })

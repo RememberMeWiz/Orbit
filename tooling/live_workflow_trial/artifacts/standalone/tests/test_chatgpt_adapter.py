@@ -334,5 +334,48 @@ class DriverParsingTests(unittest.TestCase):
         self.assertEqual(result.reason_code, "driver-unparseable-output")
 
 
+class HandoffHeaderFormatTests(unittest.TestCase):
+    """Pins a real mismatch found while collecting a genuine worker handoff.
+
+    Every delivered Orbit handoff writes header values in backticks
+    (``- Work Item: `M0-...` ``), but every accepted test fixture writes them
+    plain. The engine compares the parsed value to the filename group with ``!=``,
+    so a real handoff fails ``work-item-metadata-mismatch`` while the fixtures
+    pass. The collector deliberately keeps strict parity with the engine rather
+    than normalising -- being more permissive here would only move the rejection
+    downstream, after the file had been accepted.
+
+    These tests document current behaviour. Changing it is a contract decision,
+    not a refactor.
+    """
+
+    @staticmethod
+    def _header(work: str, sender: str) -> str:
+        return chr(10).join([
+            "## Header",
+            f"- Work Item: {work}",
+            f"- From: {sender}",
+            "- To: TL",
+            "- Status: COMPLETE",
+            "- Handoff ID: x",
+            "- Sequence: 1",
+            "",
+        ])
+
+    def test_HDR_001_backticked_header_does_not_match_filename_group(self):
+        from workflow.core.validation import parse_header
+        parsed = parse_header(self._header("`M0-WF-LIVE-003`", "`WORKER`"))
+        self.assertTrue(parsed.ok)
+        self.assertEqual(parsed.fields["work item"], "`M0-WF-LIVE-003`")
+        # The engine compares this to the filename group with !=, so a real
+        # backticked handoff fails work-item-metadata-mismatch.
+        self.assertNotEqual(parsed.fields["work item"], "M0-WF-LIVE-003")
+
+    def test_HDR_002_plain_header_matches(self):
+        from workflow.core.validation import parse_header
+        parsed = parse_header(self._header("M0-WF-LIVE-003", "WORKER"))
+        self.assertEqual(parsed.fields["work item"], "M0-WF-LIVE-003")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

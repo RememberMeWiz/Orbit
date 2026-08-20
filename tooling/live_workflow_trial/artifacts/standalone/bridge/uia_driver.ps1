@@ -339,5 +339,141 @@ switch ($Operation) {
     Done @{ text = $tail; total_length = $joined.Length; nodes = $parts.Count; truncated = ($joined.Length -gt $maxChars) }
   }
 
+  # Materialise one artifact card to an exact path via the standard Windows
+  # Save As dialog.
+  #
+  # The destination is written into the dialog's filename box, so the file lands
+  # exactly where Orbit asked and never transits a shared Downloads folder. That
+  # removes the "neighbouring file" hazard rather than merely mitigating it.
+  #
+  # Control shapes here are not the obvious ones: the common dialog exposes its
+  # filename box and Save button as ControlType Pane with ClassName Edit/Button
+  # (the legacy window wrapper), so matching on ControlType alone finds nothing.
+  # Identity is (AutomationId + ClassName).
+  #
+  # FailDlg dismisses the dialog before exiting. Plain Fail calls exit, which
+  # bypasses catch/finally, so a modal would otherwise be left on the operator's
+  # screen.
+  "save_artifact_as" {
+    $w = Get-ChatWindow
+    $filename = [string]$P.filename
+    $destination = [string]$P.destination
+    if (-not $filename -or -not $destination) { Fail "save-missing-params" }
+
+    $cards = @()
+    foreach ($e in (All-Descendants $w)) {
+      if ((CT $e) -ne "Button") { continue }
+      if ((NM $e) -like "Save $filename as*") { $cards += $e }
+    }
+    if ($cards.Count -eq 0) { Fail "artifact-card-not-found" $filename }
+    if ($cards.Count -gt 1) { Fail "artifact-card-ambiguous" "$($cards.Count) cards for $filename" }
+
+    $before = @{}
+    foreach ($tw in $UIA::RootElement.FindAll($Scope::Children, $Cond::TrueCondition)) {
+      try { $before["$($tw.Current.NativeWindowHandle)"] = $true } catch { }
+    }
+
+    if (-not (Invoke-Element $cards[0])) { Fail "artifact-card-not-invokable" }
+
+    $dlg = $null
+    for ($i = 0; $i -lt 15; $i++) {
+      Start-Sleep -Milliseconds 700
+      foreach ($tw in $UIA::RootElement.FindAll($Scope::Children, $Cond::TrueCondition)) {
+        try {
+          if ($before.ContainsKey("$($tw.Current.NativeWindowHandle)")) { continue }
+          if ($tw.Current.ClassName -eq "#32770") { $dlg = $tw; break }
+        } catch { }
+      }
+      if ($dlg) { break }
+    }
+    if ($null -eq $dlg) { Fail "save-dialog-did-not-appear" }
+
+    function FailDlg([string]$code, [string]$detail = "") {
+      try { $dlg.SetFocus(); Start-Sleep -Milliseconds 200 } catch { }
+      try { [System.Windows.Forms.SendKeys]::SendWait("{ESC}"); Start-Sleep -Milliseconds 600 } catch { }
+      Fail $code $detail
+    }
+
+    $nameBox = $null; $saveBtn = $null
+    foreach ($e in $dlg.FindAll($Scope::Descendants, $Cond::TrueCondition)) {
+      try {
+        $aid = $e.Current.AutomationId
+        $cls = $e.Current.ClassName
+        if (-not $nameBox -and $aid -eq "1001" -and $cls -eq "Edit") { $nameBox = $e }
+        if (-not $saveBtn -and $aid -eq "1" -and $cls -eq "Button") { $saveBtn = $e }
+      } catch { }
+    }
+    if ($null -eq $nameBox) { FailDlg "save-dialog-filename-box-not-found" }
+    if ($null -eq $saveBtn) { FailDlg "save-dialog-save-button-not-found" }
+
+    # The filename box is a legacy window wrapper and supports neither Value nor
+    # Text patterns, so the path goes in by clipboard paste. Its Name property
+    # does reflect the current contents, which is what makes verification
+    # possible without a pattern.
+    $previousClipboard = $null
+    try { $previousClipboard = Get-Clipboard -Raw -ErrorAction SilentlyContinue } catch { }
+    try {
+      Set-Clipboard -Value $destination
+      # Neither the filename box wrapper nor the dialog accepts a UIA SetFocus
+      # call, and neither needs one: the dialog is modal and already owns
+      # keyboard focus, with the filename box focused by default. The Name
+      # readback below is what makes this safe -- if focus were anywhere else,
+      # verification fails and nothing is committed.
+      Start-Sleep -Milliseconds 350
+      [System.Windows.Forms.SendKeys]::SendWait("^a")
+      Start-Sleep -Milliseconds 150
+      [System.Windows.Forms.SendKeys]::SendWait("^v")
+      Start-Sleep -Milliseconds 500
+    } catch {
+      try { if ($null -ne $previousClipboard) { Set-Clipboard -Value $previousClipboard } } catch { }
+      FailDlg "save-dialog-path-not-writable" $_.Exception.Message
+    } finally {
+      try { if ($null -ne $previousClipboard) { Set-Clipboard -Value $previousClipboard } } catch { }
+    }
+
+    # Confirm the box holds exactly what Orbit asked for before committing.
+    # Poll: the Name property updates asynchronously after a paste.
+    $confirmed = ""
+    for ($i = 0; $i -lt 8; $i++) {
+      $confirmed = NM $nameBox
+      if ($confirmed -ceq $destination) { break }
+      Start-Sleep -Milliseconds 350
+    }
+    if ($confirmed -cne $destination) {
+      FailDlg "save-dialog-path-not-accepted" "wrote '$destination', box holds '$confirmed'"
+    }
+
+    # The Save button is a legacy window wrapper with no Invoke pattern. Commit
+    # with Enter instead, which is the dialog's own default action.
+    #
+    # This only runs after the filename box has been read back and matched
+    # exactly, so what Enter commits is already known -- the button's presence
+    # above is a precondition proving this is a real Save As dialog, not the
+    # mechanism.
+    $committed = $false
+    try {
+      $legacy = $saveBtn.GetCurrentPattern([System.Windows.Automation.LegacyIAccessiblePattern]::Pattern)
+      $legacy.DoDefaultAction()
+      $committed = $true
+    } catch { }
+    if (-not $committed) {
+      try { [System.Windows.Forms.SendKeys]::SendWait("{ENTER}") } catch { FailDlg "save-dialog-commit-failed" $_.Exception.Message }
+    }
+
+    # The dialog closing is the app's own signal that it accepted the path.
+    $closed = $false
+    for ($i = 0; $i -lt 20; $i++) {
+      Start-Sleep -Milliseconds 600
+      $stillThere = $false
+      foreach ($tw in $UIA::RootElement.FindAll($Scope::Children, $Cond::TrueCondition)) {
+        try { if ($tw.Current.ClassName -eq "#32770" -and $tw.Current.Name -eq "Save As") { $stillThere = $true; break } } catch { }
+      }
+      if (-not $stillThere) { $closed = $true; break }
+    }
+    if (-not $closed) { FailDlg "save-dialog-did-not-close" }
+
+    Done @{ filename = $filename; destination = $destination; confirmed_path = $confirmed }
+  }
+
   default { Fail "operation-not-supported" $Operation }
 }
