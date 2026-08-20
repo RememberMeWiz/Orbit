@@ -30,6 +30,9 @@ DRIVER_OPERATIONS = (
     "press_send",
     "read_transcript_tail",
     "save_artifact_as",
+    "attach_file",
+    "attachment_state",
+    "describe_control",
 )
 
 
@@ -140,3 +143,12 @@ class UiaDriver:
 
     def save_artifact_as(self, *, filename: str, destination: str) -> UiaResult:
         return self.call("save_artifact_as", {"filename": filename, "destination": destination})
+
+    def attach_file(self, path: str) -> UiaResult:
+        return self.call("attach_file", {"path": path})
+
+    def attachment_state(self) -> UiaResult:
+        return self.call("attachment_state")
+
+    def describe_control(self, name: str) -> UiaResult:
+        return self.call("describe_control", {"name": name})

@@ -21,6 +21,61 @@ Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
 Add-Type -AssemblyName System.Windows.Forms
 
+# Last-resort activation for controls this Electron app renders without a
+# working programmatic activation path. Invoke succeeds but is inert, legacy
+# DoDefaultAction is unsupported, and keyboard focus never lands on the menu
+# entries -- all verified against the live app before adding this.
+#
+# The click point comes from the element's own UIA BoundingRectangle, never from
+# a screen capture, a model, or handoff prose. Coordinates are an ephemeral
+# actuator output computed at the moment of use and are never inputs, never
+# stored, and never exposed through a typed operation. Every caller verifies the
+# expected post-condition afterwards; a click that "worked" but changed nothing
+# still fails.
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public class OrbitCursor {
+    [DllImport("user32.dll")] public static extern bool SetCursorPos(int X, int Y);
+    [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT p);
+    [DllImport("user32.dll")] public static extern void mouse_event(uint f, uint dx, uint dy, uint d, IntPtr e);
+    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] public static extern int GetWindowThreadProcessId(IntPtr h, out int pid);
+    [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X; public int Y; }
+    public const uint LEFTDOWN = 0x0002, LEFTUP = 0x0004;
+}
+'@
+
+function Click-ElementGeometry($e, [int]$expectedPid) {
+  try {
+    # A coordinate click goes wherever the pointer is, so it is only safe when
+    # the intended application is genuinely in front. If ChatGPT is not the
+    # foreground window the click would land on whatever is -- the operator's
+    # editor, a browser, anything. Refuse rather than click blind.
+    $fg = [OrbitCursor]::GetForegroundWindow()
+    $fgPid = 0
+    [void][OrbitCursor]::GetWindowThreadProcessId($fg, [ref]$fgPid)
+    if ($expectedPid -ne 0 -and $fgPid -ne $expectedPid) { return $false }
+
+    $r = $e.Current.BoundingRectangle
+    if ($r.Width -le 0 -or $r.Height -le 0) { return $false }
+    $x = [int]($r.X + ($r.Width / 2))
+    $y = [int]($r.Y + ($r.Height / 2))
+    # Restore the pointer afterwards so the operator's cursor does not jump.
+    $origin = New-Object OrbitCursor+POINT
+    [void][OrbitCursor]::GetCursorPos([ref]$origin)
+    [void][OrbitCursor]::SetCursorPos($x, $y)
+    Start-Sleep -Milliseconds 120
+    [OrbitCursor]::mouse_event([OrbitCursor]::LEFTDOWN, 0, 0, 0, [IntPtr]::Zero)
+    Start-Sleep -Milliseconds 60
+    [OrbitCursor]::mouse_event([OrbitCursor]::LEFTUP, 0, 0, 0, [IntPtr]::Zero)
+    Start-Sleep -Milliseconds 250
+    [void][OrbitCursor]::SetCursorPos($origin.X, $origin.Y)
+    return $true
+  } catch { return $false }
+}
+
+
 $P = $ParamsJson | ConvertFrom-Json
 $UIA = [System.Windows.Automation.AutomationElement]
 $Cond = [System.Windows.Automation.Condition]
@@ -74,6 +129,18 @@ function Find-ByTypeName($root, [string]$type, [string]$name, [switch]$Exact) {
     else { if ($n -like "*$name*") { $hits += $e } }
   }
   return $hits
+}
+
+function Activate-Element($e) {
+  # Controls in this app expose different patterns depending on how they are
+  # rendered: web buttons carry Invoke, menu triggers carry ExpandCollapse, and
+  # common-dialog controls are legacy windows carrying only LegacyIAccessible.
+  # Try each rather than assuming one.
+  try { $e.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke(); return $true } catch { }
+  try { $e.GetCurrentPattern([System.Windows.Automation.LegacyIAccessiblePattern]::Pattern).DoDefaultAction(); return $true } catch { }
+  try { $e.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern).Expand(); return $true } catch { }
+  try { $e.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select(); return $true } catch { }
+  return $false
 }
 
 function Invoke-Element($e) {
@@ -473,6 +540,183 @@ switch ($Operation) {
     if (-not $closed) { FailDlg "save-dialog-did-not-close" }
 
     Done @{ filename = $filename; destination = $destination; confirmed_path = $confirmed }
+  }
+
+  # Report which files are currently staged on the composer.
+  "attachment_state" {
+    $w = Get-ChatWindow
+    $names = @()
+    foreach ($e in (All-Descendants $w)) {
+      if ((CT $e) -ne "Button") { continue }
+      $n = NM $e
+      # Staged files render with a remove affordance; that is what distinguishes
+      # an attachment chip from the same filename appearing in the transcript.
+      if ($n -like "Remove *") { $names += ($n -replace "^Remove ", "") }
+    }
+    Done @{ attached = $names; count = $names.Count }
+  }
+
+  # Attach one local file to the composer of the already-focused conversation.
+  #
+  # The path is supplied by Orbit and pasted into the file dialog, so the
+  # selection is exact rather than a click on whatever the picker happened to
+  # highlight. Nothing is sent: staging and sending are separate operations so
+  # the attachment can be verified in the UI first.
+  "attach_file" {
+    $w = Get-ChatWindow
+    $path = [string]$P.path
+    if (-not $path) { Fail "attach-missing-path" }
+    if (-not (Test-Path -LiteralPath $path)) { Fail "attach-file-not-found" $path }
+    $full = (Resolve-Path -LiteralPath $path).Path
+
+    $attach = $null
+    foreach ($e in (All-Descendants $w)) {
+      if ((CT $e) -eq "Button" -and (NM $e) -ceq "Add files and more") { $attach = $e; break }
+    }
+    if ($null -eq $attach) { Fail "attach-control-not-found" }
+
+    $before = @{}
+    foreach ($tw in $UIA::RootElement.FindAll($Scope::Children, $Cond::TrueCondition)) {
+      try { $before["$($tw.Current.NativeWindowHandle)"] = $true } catch { }
+    }
+
+    if (-not (Activate-Element $attach)) { Fail "attach-control-not-activatable" }
+    Start-Sleep -Milliseconds 1200
+
+    $picker = $null
+    foreach ($e in (All-Descendants $w)) {
+      if ((CT $e) -eq "Button" -and (NM $e) -ceq "Add photos & files") { $picker = $e; break }
+    }
+    if ($null -eq $picker) {
+      try { [System.Windows.Forms.SendKeys]::SendWait("{ESC}") } catch { }
+      Fail "attach-menu-entry-not-found"
+    }
+
+    # Activation path for this entry, established by testing against the live
+    # app rather than assumed:
+    #   UIA Invoke                -> reports success, does nothing (Electron)
+    #   LegacyIAccessible         -> unsupported
+    #   ExpandCollapse            -> no-op
+    #   keyboard focus navigation -> focus never lands on menu entries
+    #
+    # So the click point is taken from the element's own UIA BoundingRectangle.
+    # It is an ephemeral actuator output computed at the moment of use: never an
+    # input, never stored, never reachable from a typed operation or from prose.
+    # The dialog check below is the post-condition -- a click that "worked" but
+    # opened nothing still fails.
+    $chatPid = 0
+    try { $chatPid = (Get-Process -Name ChatGPT | Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1).Id } catch { }
+    if (-not (Click-ElementGeometry $picker $chatPid)) {
+      try { [System.Windows.Forms.SendKeys]::SendWait("{ESC}") } catch { }
+      Fail "attach-menu-entry-not-activatable" "no semantic activation path; geometry click refused or failed (ChatGPT must be the foreground window)"
+    }
+    $activation = "geometry-fallback"
+
+    # A first-time file dialog can be slow to construct, so wait generously
+    # rather than reporting a false negative. Record what did appear so a
+    # failure says something useful instead of just "nothing".
+    $dlg = $null
+    $seen = @()
+    for ($i = 0; $i -lt 40; $i++) {
+      Start-Sleep -Milliseconds 700
+      foreach ($tw in $UIA::RootElement.FindAll($Scope::Children, $Cond::TrueCondition)) {
+        try {
+          if ($before.ContainsKey("$($tw.Current.NativeWindowHandle)")) { continue }
+          $seen += "$($tw.Current.ClassName)|$($tw.Current.Name)"
+          if ($tw.Current.ClassName -eq "#32770") { $dlg = $tw; break }
+        } catch { }
+      }
+      if ($dlg) { break }
+    }
+    if ($null -eq $dlg) {
+      try { [System.Windows.Forms.SendKeys]::SendWait("{ESC}") } catch { }
+      Fail "attach-dialog-did-not-appear" (($seen | Select-Object -Unique -First 6) -join " ; ")
+    }
+
+    function FailPick([string]$code, [string]$detail = "") {
+      try { [System.Windows.Forms.SendKeys]::SendWait("{ESC}"); Start-Sleep -Milliseconds 600 } catch { }
+      Fail $code $detail
+    }
+
+    $nameBox = $null; $openBtn = $null
+    foreach ($e in $dlg.FindAll($Scope::Descendants, $Cond::TrueCondition)) {
+      try {
+        $aid = $e.Current.AutomationId; $cls = $e.Current.ClassName
+        if (-not $nameBox -and $aid -eq "1148" -and $cls -eq "Edit") { $nameBox = $e }
+        if (-not $nameBox -and $aid -eq "1001" -and $cls -eq "Edit") { $nameBox = $e }
+        if (-not $openBtn -and $aid -eq "1" -and $cls -eq "Button") { $openBtn = $e }
+      } catch { }
+    }
+    if ($null -eq $nameBox) { FailPick "attach-dialog-filename-box-not-found" }
+
+    $previousClipboard = $null
+    try { $previousClipboard = Get-Clipboard -Raw -ErrorAction SilentlyContinue } catch { }
+    try {
+      Set-Clipboard -Value $full
+      Start-Sleep -Milliseconds 350
+      [System.Windows.Forms.SendKeys]::SendWait("^a")
+      Start-Sleep -Milliseconds 150
+      [System.Windows.Forms.SendKeys]::SendWait("^v")
+      Start-Sleep -Milliseconds 500
+    } catch {
+      FailPick "attach-dialog-path-not-writable" $_.Exception.Message
+    } finally {
+      try { if ($null -ne $previousClipboard) { Set-Clipboard -Value $previousClipboard } } catch { }
+    }
+
+    $confirmed = ""
+    for ($i = 0; $i -lt 8; $i++) {
+      $confirmed = NM $nameBox
+      if ($confirmed -ceq $full) { break }
+      Start-Sleep -Milliseconds 350
+    }
+    if ($confirmed -cne $full) { FailPick "attach-dialog-path-not-accepted" "wrote '$full', box holds '$confirmed'" }
+
+    $committed = $false
+    if ($openBtn) { $committed = Activate-Element $openBtn }
+    if (-not $committed) {
+      try { [System.Windows.Forms.SendKeys]::SendWait("{ENTER}") } catch { FailPick "attach-commit-failed" }
+    }
+
+    $closed = $false
+    for ($i = 0; $i -lt 20; $i++) {
+      Start-Sleep -Milliseconds 600
+      $stillThere = $false
+      foreach ($tw in $UIA::RootElement.FindAll($Scope::Children, $Cond::TrueCondition)) {
+        try { if ($tw.Current.ClassName -eq "#32770" -and -not $before.ContainsKey("$($tw.Current.NativeWindowHandle)")) { $stillThere = $true; break } } catch { }
+      }
+      if (-not $stillThere) { $closed = $true; break }
+    }
+    if (-not $closed) { FailPick "attach-dialog-did-not-close" }
+
+    $leaf = Split-Path -Leaf $full
+    Done @{ path = $full; filename = $leaf; activation = $activation }
+  }
+
+  # Read-only introspection of one named control. Used to discover which
+  # activation pattern a control actually supports instead of assuming, since
+  # this app renders otherwise-identical controls with different patterns.
+  "describe_control" {
+    $w = Get-ChatWindow
+    $wanted = [string]$P.name
+    if (-not $wanted) { Fail "describe-missing-name" }
+    $hits = @()
+    foreach ($e in (All-Descendants $w)) {
+      $n = NM $e
+      if ($n -cne $wanted) { continue }
+      $pats = @()
+      try { foreach ($pat in $e.GetSupportedPatterns()) { $pats += ($pat.ProgrammaticName -replace "PatternIdentifiers\.Pattern", "") } } catch { }
+      $hits += @{
+        control_type = (CT $e)
+        class_name = (ClassOf $e)
+        automation_id = $e.Current.AutomationId
+        enabled = $e.Current.IsEnabled
+        keyboard_focusable = $e.Current.IsKeyboardFocusable
+        offscreen = $e.Current.IsOffscreen
+        patterns = $pats
+      }
+    }
+    Done @{ name = $wanted; matches = $hits; count = $hits.Count }
   }
 
   default { Fail "operation-not-supported" $Operation }
