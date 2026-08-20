@@ -39,7 +39,7 @@ def envelope(request_id, *, directive_id="dir-1", target="windows-workflow", act
         f"action: {action}",
         f"target_endpoint: {target}",
     ])
-    return "```\nORBIT_DIRECTIVE\n" + body + "\n```"
+    return "ChatGPT said:\n```\nORBIT_DIRECTIVE\n" + body + "\n```"
 
 
 class RestartBase(unittest.TestCase):

@@ -111,7 +111,7 @@ class ScriptedDriver(StubDriver):
             "action: DISPATCH_TO_ROLE",
             "target_endpoint: windows-workflow",
         ])
-        text = "Go ahead.\n\n```\nORBIT_DIRECTIVE\n" + body + "\n```\n"
+        text = "ChatGPT said:\nGo ahead.\n\n```\nORBIT_DIRECTIVE\n" + body + "\n```\n"
         return ok({"text": text, "nodes": 1, "total_length": len(text)})
 
     def _open_request_id(self) -> str:
@@ -262,7 +262,7 @@ class JournalTests(CycleBase):
             self.assertTrue(line["at"])
 
     def test_RT_021_an_interrupted_cycle_is_readable_up_to_where_it_stopped(self):
-        self.driver.directive_text = "sure, go ahead"      # prose, never a directive
+        self.driver.directive_text = "ChatGPT said:\nsure, go ahead"      # prose, never a directive
         result = self.run_cycle()
         self.assertFalse(result.completed)
         self.assertEqual(result.stopped_at, "await_directive")
@@ -292,7 +292,7 @@ class HaltTests(CycleBase):
 
     def test_RT_031_a_directive_for_a_different_work_item_is_refused(self):
         self.driver.directive_text = (
-            "```\nORBIT_DIRECTIVE\nversion: 0.1\nrequest_id: whatever\n"
+            "ChatGPT said:\n```\nORBIT_DIRECTIVE\nversion: 0.1\nrequest_id: whatever\n"
             "directive_id: d\nwork_item: SOME-OTHER-ITEM\naction: DISPATCH_TO_ROLE\n"
             "target_endpoint: windows-workflow\n```")
         result = self.run_cycle()
@@ -301,7 +301,7 @@ class HaltTests(CycleBase):
 
     def test_RT_032_a_target_pm_never_registered_is_refused(self):
         self.driver.directive_text = (
-            "```\nORBIT_DIRECTIVE\nversion: 0.1\nrequest_id: PLACEHOLDER\n"
+            "ChatGPT said:\n```\nORBIT_DIRECTIVE\nversion: 0.1\nrequest_id: PLACEHOLDER\n"
             "directive_id: d\nwork_item: " + WORK_ITEM + "\naction: DISPATCH_TO_ROLE\n"
             "target_endpoint: some-chat-from-prose\n```")
         result = self.cycle().run(

@@ -148,6 +148,32 @@ class DirectiveVerdict:
     detail: str = ""
 
 
+# How the app labels each turn in the transcript. These are the only provenance
+# signal the accessibility tree offers, and they are what separates "PM decided
+# this" from "someone put this text in the conversation".
+ASSISTANT_MARKER = re.compile(r"(?m)^\s*ChatGPT said:\s*$")
+USER_MARKER = re.compile(r"(?m)^\s*You said:\s*$")
+
+
+def assistant_turns(text: str) -> List[str]:
+    """The stretches of transcript the assistant itself authored.
+
+    Everything else -- what Orbit posted, what a human pasted, quoted logs,
+    attachments rendered inline -- is somebody else's text sitting in the same
+    conversation, and must not be able to authorise anything.
+
+    A transcript with no turn markers yields nothing rather than the whole
+    blob. Absent provenance is not weak provenance; it is none, and the caller
+    fails closed on an empty list.
+    """
+    turns: List[str] = []
+    for match in ASSISTANT_MARKER.finditer(text):
+        rest = text[match.end():]
+        nxt = USER_MARKER.search(rest)
+        turns.append(rest[:nxt.start()] if nxt else rest)
+    return turns
+
+
 def _candidate_bodies(text: str) -> List[str]:
     """Every stretch of text that could be an envelope, oldest first.
 
@@ -207,23 +233,37 @@ def _parse_one(body: str) -> Tuple[Optional[PMDirective], str]:
     ), "directive-parsed"
 
 
-def parse_envelope(text: str) -> Tuple[Optional[PMDirective], str]:
+def parse_envelope(text: str, *, require_assistant_turn: bool = True
+                   ) -> Tuple[Optional[PMDirective], str]:
     """Extract PM's most recent decision, or say why there isn't one.
 
-    Scanned newest-first, because a transcript accumulates: Orbit's own request
-    and its reply template sit above PM's answer, and the app's accessibility
-    tree fragments a syntax-highlighted code block across lines, so the older
-    candidates are usually malformed. Taking the first match meant Orbit read
-    its own template and reported PM as having answered badly.
+    Two independent restrictions, and both matter.
 
-    A malformed candidate is therefore skipped rather than fatal. Only when
-    nothing parses is a reason returned, and it is the newest candidate's --
-    that is the one PM most likely just wrote.
+    *Provenance.* Only text the assistant authored is searched. A well-formed
+    envelope is trivial to write, so field-level validity says nothing about
+    who wrote it: Orbit's own reply template, a pasted log, an attachment
+    rendered inline, or a message crafted to name the live request_id would all
+    pass every field check. Scoping to assistant turns is what makes the
+    envelope a decision rather than a string that appeared in a conversation.
+
+    *Recency.* Within those turns, newest-first, because a transcript
+    accumulates and PM's latest decision is the operative one. A malformed
+    candidate is skipped rather than fatal; only when nothing parses is a
+    reason returned, and it is the newest candidate's.
+
+    `require_assistant_turn=False` exists for parsing a body already known to
+    have come from a trusted channel. It must never be set from transcript text.
     """
     if not text:
         return None, "directive-absent"
 
-    bodies = _candidate_bodies(text)
+    if require_assistant_turn:
+        turns = assistant_turns(text)
+        if not turns:
+            return None, "directive-provenance-unknown"
+        bodies = [b for turn in turns for b in _candidate_bodies(turn)]
+    else:
+        bodies = _candidate_bodies(text)
     if not bodies:
         return None, "directive-absent"
 

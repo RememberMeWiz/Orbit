@@ -28,7 +28,7 @@ def envelope(request_id, *, directive_id="dir-1", work_item=WORK_ITEM,
         f"action: {action}",
         f"target_endpoint: {target}",
     ])
-    return "Looks good.\n\n```\nORBIT_DIRECTIVE\n" + body + "\n```\n"
+    return "ChatGPT said:\nLooks good.\n\n```\nORBIT_DIRECTIVE\n" + body + "\n```\n"
 
 
 class LoopBase(unittest.TestCase):
@@ -151,7 +151,7 @@ class DirectiveTests(LoopBase):
     def test_LOOP_012_prose_only_keeps_waiting(self):
         loop = self.loop()
         self.open_request(loop)
-        self.driver.transcript = "yes go ahead, dispatch it please"
+        self.driver.transcript = "ChatGPT said:\nyes go ahead, dispatch it please"
         out = loop.await_directive(timeout=30.0)
         self.assertEqual(out.action, "AWAITING_PM")
         self.assertEqual(out.reason_code, "directive-absent")

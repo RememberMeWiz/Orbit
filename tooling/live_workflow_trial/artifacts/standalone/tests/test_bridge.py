@@ -134,7 +134,7 @@ class PMControlTests(unittest.TestCase):
         }
         fields.update(over)
         body = "\n".join(f"{k}: {v}" for k, v in fields.items())
-        return f"Looks good, send it on.\n\n```\nORBIT_DIRECTIVE\n{body}\n```\n"
+        return f"ChatGPT said:\nLooks good, send it on.\n\n```\nORBIT_DIRECTIVE\n{body}\n```\n"
 
     def test_PM_001_valid_directive_for_active_request_executes(self):
         verdict = self.state.evaluate(self.envelope())
@@ -155,7 +155,7 @@ class PMControlTests(unittest.TestCase):
     def test_PM_004_prose_without_envelope_does_not_execute(self):
         for prose in [
             "Yes go ahead, dispatch it to architecture-tl please.",
-            "ORBIT_DIRECTIVE is the envelope format we use, by the way.",
+            "ChatGPT said:\nORBIT_DIRECTIVE is the envelope format we use, by the way.",
             "approved",
             "",
         ]:
