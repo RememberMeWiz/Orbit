@@ -5,12 +5,12 @@
 
 | Field | Value |
 | :--- | :--- |
-| Updated | 2026-08-21T00:45Z |
+| Updated | 2026-08-21T02:20Z |
 | Branch | `claude/m0-autonomous-longrun-001` |
 | Started from | `446e43af18445067a9bc227bb810ce17069929cf` (head of `claude/m0-wf-apprentice-002`) |
-| HEAD | `ffe46cf` |
+| HEAD | `1dce4ec` |
 | Current phase | **B — live zero-courier trial** |
-| Current objective | B4 — repeat the chain with no human UI clicks (addendum item D) |
+| Current objective | E — multi-endpoint supervision, then F/G Steward transport |
 | Blocker | NONE |
 
 ---
@@ -152,10 +152,10 @@ for supervised runs.
 
 ```text
 workflow     67 pass
-standalone  330 pass   (2 skipped: symlink creation needs Developer Mode;
+standalone  352 pass   (2 skipped: symlink creation needs Developer Mode;
                         Windows junction coverage supersedes them)
 native       14 pass
-TOTAL       411 pass, 2 skipped, 0 release-blocking skips
+TOTAL       433 pass, 2 skipped, 0 release-blocking skips
 ```
 
 ---
@@ -248,6 +248,47 @@ directive at all, because absent provenance is none rather than weak.
 Claims 1, 5 and 6 remain open and are recorded, not glossed. Claim 4's residual
 is concurrency: the ledger prevents a restarted runner from resending, but two
 concurrent runners are a separate problem needing a single-writer lock.
+
+### Addendum item D — three consecutive hops, zero human UI clicks
+
+| hop | endpoint | returned | bytes | source |
+| :--- | :--- | :--- | ---: | :--- |
+| 4 | `windows-worker` | transcript-collection review | 6380 | transcript |
+| 5 | `architecture-tl` | single-writer design | 10042 | transcript |
+| 6 | `windows-worker` | concurrency harness spec | 8935 | transcript |
+
+Each ran as one `hop` command: dispatch, wait, collect, report. No file
+artifact, no work-mode prompt, no credits, nothing clicked.
+
+### QA Claim 4 residual — closed
+
+The ledger stopped a *restarted* runner resending; it never showed two
+*concurrent* runners could not each actuate once. Now a Windows named mutex
+guards the whole delivery, held across reload, stage, actuate and persist.
+
+Deliberately **no lease timer**. A lease creates the failure it aims to prevent:
+the dangerous window is the one where a holder is slow — inside actuation — and
+any timeout long enough to be safe is too long to be useful. Process death is
+the only expiry; a waiter that times out reports `writer-busy` and stops.
+
+Two properties measured rather than assumed, both of which changed the code:
+
+- `WAIT_ABANDONED` fires only when a waiter already held an open handle at the
+  moment of death. A runner starting fresh afterwards sees nothing. So
+  `recovered` is recorded and never branched on — safety comes from reloading
+  the ledger unconditionally, where a mid-actuation record reconciles to
+  `AMBIGUOUS`.
+- A Windows mutex is re-entrant for the owning thread, so the first draft of the
+  tests passed vacuously with an in-process blocker. Every blocker is now a real
+  subprocess.
+
+Claim narrowed to what is true:
+
+> Orbit guarantees at-most-once **local** Send actuation per delivery record
+> among **participating** Orbit runners on the same Windows installation.
+
+Not exactly-once remote delivery, and no constraint on a human pressing Send in
+the same conversation.
 
 ## Defects found live, all fixed
 
