@@ -33,6 +33,7 @@ DRIVER_OPERATIONS = (
     "attach_file",
     "attachment_state",
     "describe_control",
+    "clear_attachments",
 )
 
 
@@ -152,3 +153,6 @@ class UiaDriver:
 
     def describe_control(self, name: str) -> UiaResult:
         return self.call("describe_control", {"name": name})
+
+    def clear_attachments(self) -> UiaResult:
+        return self.call("clear_attachments")

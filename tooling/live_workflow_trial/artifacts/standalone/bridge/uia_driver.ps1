@@ -41,10 +41,44 @@ public class OrbitCursor {
     [DllImport("user32.dll")] public static extern void mouse_event(uint f, uint dx, uint dy, uint d, IntPtr e);
     [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll")] public static extern int GetWindowThreadProcessId(IntPtr h, out int pid);
+    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+    [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int cmd);
+    [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint a, uint b, bool attach);
+    [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
+    [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
     [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X; public int Y; }
     public const uint LEFTDOWN = 0x0002, LEFTUP = 0x0004;
 }
 '@
+
+# Declare DPI awareness before any geometry is read or any cursor is moved.
+#
+# This display runs at 125% scaling (1920x1080 physical, 1536x864 reported to a
+# DPI-unaware process). UIA BoundingRectangle returns physical coordinates, but
+# SetCursorPos from an unaware process is interpreted in the scaled space and
+# multiplied by 1.25 -- so a click aimed at a menu item landed ~200px away,
+# dismissing the menu without hitting anything. Becoming DPI-aware puts both
+# APIs in the same coordinate space.
+[void][OrbitCursor]::SetProcessDPIAware()
+
+function Bring-ChatToFront([IntPtr]$hwnd) {
+  # A coordinate click only makes sense when the target app is actually in
+  # front. Windows refuses SetForegroundWindow from a background process unless
+  # the calling thread is attached to the foreground thread's input queue, so
+  # attach, raise, then detach. Bounded to the already-verified ChatGPT window.
+  try {
+    $fg = [OrbitCursor]::GetForegroundWindow()
+    $fgThread = [OrbitCursor]::GetWindowThreadProcessId($fg, [ref]([int]0))
+    $ourThread = [OrbitCursor]::GetCurrentThreadId()
+    [void][OrbitCursor]::AttachThreadInput($fgThread, $ourThread, $true)
+    [void][OrbitCursor]::ShowWindow($hwnd, 9)   # SW_RESTORE
+    [void][OrbitCursor]::SetForegroundWindow($hwnd)
+    [void][OrbitCursor]::AttachThreadInput($fgThread, $ourThread, $false)
+    Start-Sleep -Milliseconds 500
+    $now = [OrbitCursor]::GetForegroundWindow()
+    return ($now -eq $hwnd)
+  } catch { return $false }
+}
 
 function Click-ElementGeometry($e, [int]$expectedPid) {
   try {
@@ -558,139 +592,97 @@ switch ($Operation) {
 
   # Attach one local file to the composer of the already-focused conversation.
   #
-  # The path is supplied by Orbit and pasted into the file dialog, so the
-  # selection is exact rather than a click on whatever the picker happened to
-  # highlight. Nothing is sent: staging and sending are separate operations so
-  # the attachment can be verified in the UI first.
+  # This does NOT drive the "Add files and more" menu. That path was implemented
+  # and abandoned after testing: the menu opens, but its "Add photos & files"
+  # entry cannot be activated. UIA Invoke reports success and does nothing,
+  # LegacyIAccessible is unsupported, ExpandCollapse is a no-op, keyboard focus
+  # never lands on menu entries, and a click on the element's own reported
+  # rectangle dismisses the menu without hitting the item. See the burst handoff.
+  #
+  # Instead the file is placed on the clipboard as a file-drop list and pasted
+  # into the composer, which is the same mechanism a person uses with Ctrl+V.
+  # It needs no menu, no file dialog, and no coordinates at all -- so it removes
+  # the GUI fragility rather than working around it.
+  #
+  # Nothing is sent: staging and sending stay separate so the attachment can be
+  # verified in the UI first.
   "attach_file" {
     $w = Get-ChatWindow
     $path = [string]$P.path
     if (-not $path) { Fail "attach-missing-path" }
     if (-not (Test-Path -LiteralPath $path)) { Fail "attach-file-not-found" $path }
     $full = (Resolve-Path -LiteralPath $path).Path
+    $leaf = Split-Path -Leaf $full
 
-    $attach = $null
+    $composer = $null
     foreach ($e in (All-Descendants $w)) {
-      if ((CT $e) -eq "Button" -and (NM $e) -ceq "Add files and more") { $attach = $e; break }
+      if ((CT $e) -eq "Edit" -and (ClassOf $e) -like "*ProseMirror*") { $composer = $e; break }
     }
-    if ($null -eq $attach) { Fail "attach-control-not-found" }
+    if ($null -eq $composer) { Fail "composer-not-found" }
 
-    $before = @{}
-    foreach ($tw in $UIA::RootElement.FindAll($Scope::Children, $Cond::TrueCondition)) {
-      try { $before["$($tw.Current.NativeWindowHandle)"] = $true } catch { }
-    }
-
-    if (-not (Activate-Element $attach)) { Fail "attach-control-not-activatable" }
-    Start-Sleep -Milliseconds 1200
-
-    $picker = $null
-    foreach ($e in (All-Descendants $w)) {
-      if ((CT $e) -eq "Button" -and (NM $e) -ceq "Add photos & files") { $picker = $e; break }
-    }
-    if ($null -eq $picker) {
-      try { [System.Windows.Forms.SendKeys]::SendWait("{ESC}") } catch { }
-      Fail "attach-menu-entry-not-found"
-    }
-
-    # Activation path for this entry, established by testing against the live
-    # app rather than assumed:
-    #   UIA Invoke                -> reports success, does nothing (Electron)
-    #   LegacyIAccessible         -> unsupported
-    #   ExpandCollapse            -> no-op
-    #   keyboard focus navigation -> focus never lands on menu entries
-    #
-    # So the click point is taken from the element's own UIA BoundingRectangle.
-    # It is an ephemeral actuator output computed at the moment of use: never an
-    # input, never stored, never reachable from a typed operation or from prose.
-    # The dialog check below is the post-condition -- a click that "worked" but
-    # opened nothing still fails.
-    $chatPid = 0
-    try { $chatPid = (Get-Process -Name ChatGPT | Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1).Id } catch { }
-    if (-not (Click-ElementGeometry $picker $chatPid)) {
-      try { [System.Windows.Forms.SendKeys]::SendWait("{ESC}") } catch { }
-      Fail "attach-menu-entry-not-activatable" "no semantic activation path; geometry click refused or failed (ChatGPT must be the foreground window)"
-    }
-    $activation = "geometry-fallback"
-
-    # A first-time file dialog can be slow to construct, so wait generously
-    # rather than reporting a false negative. Record what did appear so a
-    # failure says something useful instead of just "nothing".
-    $dlg = $null
-    $seen = @()
-    for ($i = 0; $i -lt 40; $i++) {
-      Start-Sleep -Milliseconds 700
-      foreach ($tw in $UIA::RootElement.FindAll($Scope::Children, $Cond::TrueCondition)) {
-        try {
-          if ($before.ContainsKey("$($tw.Current.NativeWindowHandle)")) { continue }
-          $seen += "$($tw.Current.ClassName)|$($tw.Current.Name)"
-          if ($tw.Current.ClassName -eq "#32770") { $dlg = $tw; break }
-        } catch { }
-      }
-      if ($dlg) { break }
-    }
-    if ($null -eq $dlg) {
-      try { [System.Windows.Forms.SendKeys]::SendWait("{ESC}") } catch { }
-      Fail "attach-dialog-did-not-appear" (($seen | Select-Object -Unique -First 6) -join " ; ")
-    }
-
-    function FailPick([string]$code, [string]$detail = "") {
-      try { [System.Windows.Forms.SendKeys]::SendWait("{ESC}"); Start-Sleep -Milliseconds 600 } catch { }
-      Fail $code $detail
-    }
-
-    $nameBox = $null; $openBtn = $null
-    foreach ($e in $dlg.FindAll($Scope::Descendants, $Cond::TrueCondition)) {
-      try {
-        $aid = $e.Current.AutomationId; $cls = $e.Current.ClassName
-        if (-not $nameBox -and $aid -eq "1148" -and $cls -eq "Edit") { $nameBox = $e }
-        if (-not $nameBox -and $aid -eq "1001" -and $cls -eq "Edit") { $nameBox = $e }
-        if (-not $openBtn -and $aid -eq "1" -and $cls -eq "Button") { $openBtn = $e }
-      } catch { }
-    }
-    if ($null -eq $nameBox) { FailPick "attach-dialog-filename-box-not-found" }
-
+    # Clipboard is global state; save and restore the text contents around this.
     $previousClipboard = $null
     try { $previousClipboard = Get-Clipboard -Raw -ErrorAction SilentlyContinue } catch { }
+
     try {
-      Set-Clipboard -Value $full
-      Start-Sleep -Milliseconds 350
-      [System.Windows.Forms.SendKeys]::SendWait("^a")
-      Start-Sleep -Milliseconds 150
+      $files = New-Object System.Collections.Specialized.StringCollection
+      [void]$files.Add($full)
+      [System.Windows.Forms.Clipboard]::SetFileDropList($files)
+      Start-Sleep -Milliseconds 400
+
+      $composer.SetFocus()
+      Start-Sleep -Milliseconds 300
       [System.Windows.Forms.SendKeys]::SendWait("^v")
-      Start-Sleep -Milliseconds 500
+      Start-Sleep -Milliseconds 1500
     } catch {
-      FailPick "attach-dialog-path-not-writable" $_.Exception.Message
+      try { if ($null -ne $previousClipboard) { Set-Clipboard -Value $previousClipboard } } catch { }
+      Fail "attach-clipboard-paste-failed" $_.Exception.Message
     } finally {
       try { if ($null -ne $previousClipboard) { Set-Clipboard -Value $previousClipboard } } catch { }
     }
 
-    $confirmed = ""
-    for ($i = 0; $i -lt 8; $i++) {
-      $confirmed = NM $nameBox
-      if ($confirmed -ceq $full) { break }
-      Start-Sleep -Milliseconds 350
-    }
-    if ($confirmed -cne $full) { FailPick "attach-dialog-path-not-accepted" "wrote '$full', box holds '$confirmed'" }
-
-    $committed = $false
-    if ($openBtn) { $committed = Activate-Element $openBtn }
-    if (-not $committed) {
-      try { [System.Windows.Forms.SendKeys]::SendWait("{ENTER}") } catch { FailPick "attach-commit-failed" }
-    }
-
-    $closed = $false
-    for ($i = 0; $i -lt 20; $i++) {
-      Start-Sleep -Milliseconds 600
-      $stillThere = $false
-      foreach ($tw in $UIA::RootElement.FindAll($Scope::Children, $Cond::TrueCondition)) {
-        try { if ($tw.Current.ClassName -eq "#32770" -and -not $before.ContainsKey("$($tw.Current.NativeWindowHandle)")) { $stillThere = $true; break } } catch { }
+    # Post-condition: the app must show the file staged, by its own remove
+    # affordance. A paste that appeared to work but staged nothing still fails.
+    $staged = @()
+    for ($i = 0; $i -lt 15; $i++) {
+      Start-Sleep -Milliseconds 700
+      $staged = @()
+      foreach ($e in (All-Descendants $w)) {
+        if ((CT $e) -ne "Button") { continue }
+        $n = NM $e
+        if ($n -like "Remove *") { $staged += ($n -replace "^Remove ", "") }
       }
-      if (-not $stillThere) { $closed = $true; break }
+      if ($staged -contains $leaf) { break }
     }
-    if (-not $closed) { FailPick "attach-dialog-did-not-close" }
+    if ($staged -notcontains $leaf) {
+      Fail "attach-not-staged" "expected '$leaf', staged: $($staged -join ', ')"
+    }
 
-    $leaf = Split-Path -Leaf $full
-    Done @{ path = $full; filename = $leaf; activation = $activation }
+    Done @{ path = $full; filename = $leaf; staged = $staged; activation = "clipboard-file-drop" }
+  }
+
+  # Remove staged attachments from the composer. Used to leave the app clean
+  # when a dispatch is abandoned, so an unsent file is never left lying in a
+  # real conversation.
+  "clear_attachments" {
+    $w = Get-ChatWindow
+    $removed = @()
+    for ($pass = 0; $pass -lt 10; $pass++) {
+      $btn = $null
+      foreach ($e in (All-Descendants $w)) {
+        if ((CT $e) -eq "Button" -and (NM $e) -like "Remove *") { $btn = $e; break }
+      }
+      if ($null -eq $btn) { break }
+      $name = (NM $btn) -replace "^Remove ", ""
+      if (-not (Activate-Element $btn)) { break }
+      $removed += $name
+      Start-Sleep -Milliseconds 700
+    }
+    $left = @()
+    foreach ($e in (All-Descendants $w)) {
+      if ((CT $e) -eq "Button" -and (NM $e) -like "Remove *") { $left += ((NM $e) -replace "^Remove ", "") }
+    }
+    Done @{ removed = $removed; remaining = $left }
   }
 
   # Read-only introspection of one named control. Used to discover which

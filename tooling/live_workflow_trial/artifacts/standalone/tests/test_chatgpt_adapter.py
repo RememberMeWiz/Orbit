@@ -49,6 +49,8 @@ class StubDriver:
         self.state_index = 0
         self.send_result = ok({"sent": True})
         self.artifacts = {"saveable": [], "previewable": []}
+        self.attached: List[str] = []
+        self.attach_result = None
         self.__dict__.update(overrides)
 
     def snapshot(self, chat_list_name=""):
@@ -87,6 +89,24 @@ class StubDriver:
     def list_artifacts(self):
         self.calls.append("list_artifacts")
         return ok(dict(self.artifacts))
+
+    def attach_file(self, path):
+        self.calls.append("attach_file")
+        if self.attach_result is not None:
+            return self.attach_result
+        import os
+        self.attached.append(os.path.basename(str(path)))
+        return ok({"filename": os.path.basename(str(path)), "activation": "clipboard-file-drop"})
+
+    def attachment_state(self):
+        self.calls.append("attachment_state")
+        return ok({"attached": list(self.attached), "count": len(self.attached)})
+
+    def clear_attachments(self):
+        self.calls.append("clear_attachments")
+        removed = list(self.attached)
+        self.attached = []
+        return ok({"removed": removed, "remaining": []})
 
     def call(self, operation, params=None):
         return getattr(self, operation)()
@@ -375,6 +395,82 @@ class HandoffHeaderFormatTests(unittest.TestCase):
         from workflow.core.validation import parse_header
         parsed = parse_header(self._header("M0-WF-LIVE-003", "WORKER"))
         self.assertEqual(parsed.fields["work item"], "M0-WF-LIVE-003")
+
+
+class AttachTests(unittest.TestCase):
+    def _file(self, tmpdir, name="HANDOFF_WI-1_WORKER_TO_TL.md", body=b"# Orbit Handoff"):
+        from pathlib import Path
+        p = Path(tmpdir) / name
+        p.write_bytes(body)
+        return p
+
+    def test_CHAT_010_digest_mismatch_refuses_and_attaches_nothing(self):
+        import tempfile
+        driver = StubDriver()
+        adapter = build(driver)
+        with tempfile.TemporaryDirectory() as tmp:
+            f = self._file(tmp)
+            result = adapter.attach_artifact(endpoint_id="orbit-pm", path=f, expected_sha256="0" * 64)
+        self.assertFalse(result.ok)
+        self.assertEqual(result.reason_code, "attach-digest-mismatch")
+        self.assertNotIn("attach_file", driver.calls)
+        self.assertEqual(driver.attached, [])
+
+    def test_CHAT_010b_correct_digest_stages(self):
+        import hashlib, tempfile
+        driver = StubDriver()
+        adapter = build(driver)
+        with tempfile.TemporaryDirectory() as tmp:
+            f = self._file(tmp)
+            digest = hashlib.sha256(f.read_bytes()).hexdigest()
+            result = adapter.attach_artifact(endpoint_id="orbit-pm", path=f, expected_sha256=digest)
+        self.assertTrue(result.ok)
+        self.assertEqual(result.data["sha256"], digest)
+        self.assertIn("HANDOFF_WI-1_WORKER_TO_TL.md", result.data["staged"])
+
+    def test_CHAT_010c_missing_file_refuses(self):
+        adapter = build(StubDriver())
+        from pathlib import Path
+        result = adapter.attach_artifact(endpoint_id="orbit-pm", path=Path("no-such-file.md"))
+        self.assertFalse(result.ok)
+        self.assertEqual(result.reason_code, "attach-file-not-found")
+
+    def test_CHAT_011c_app_not_showing_the_file_is_not_attached(self):
+        """A staging call that reports success but stages nothing must fail."""
+        import tempfile
+
+        class Silent(StubDriver):
+            def attach_file(self, path):
+                self.calls.append("attach_file")
+                return ok({"filename": "something-else.md"})   # never staged
+
+        driver = Silent()
+        adapter = build(driver)
+        with tempfile.TemporaryDirectory() as tmp:
+            f = self._file(tmp)
+            result = adapter.attach_artifact(endpoint_id="orbit-pm", path=f)
+        self.assertFalse(result.ok)
+        self.assertEqual(result.reason_code, "attach-not-confirmed")
+
+    def test_CHAT_015c_streaming_blocks_attach(self):
+        import tempfile
+        # focus() does not consume a response_state call, so the very first one
+        # the adapter makes is the streaming check.
+        driver = StubDriver(state_sequence=["streaming"])
+        adapter = build(driver)
+        with tempfile.TemporaryDirectory() as tmp:
+            f = self._file(tmp)
+            result = adapter.attach_artifact(endpoint_id="orbit-pm", path=f)
+        self.assertFalse(result.ok)
+        self.assertEqual(result.reason_code, "response-in-progress")
+        self.assertNotIn("attach_file", driver.calls)
+
+    def test_CHAT_015d_clear_removes_staged_files(self):
+        driver = StubDriver(attached=["a.md", "b.md"])
+        result = build(driver).clear_attachments()
+        self.assertTrue(result.ok)
+        self.assertEqual(result.data["remaining"], [])
+        self.assertEqual(driver.attached, [])
 
 
 if __name__ == "__main__":

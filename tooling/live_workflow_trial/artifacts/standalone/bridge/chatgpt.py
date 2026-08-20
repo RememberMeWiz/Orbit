@@ -411,3 +411,65 @@ class ChatGptAdapter:
             "handoff_id": fields.get("handoff id"),
             "sequence": fields.get("sequence"),
         })
+
+    def attach_artifact(
+        self,
+        *,
+        endpoint_id: str,
+        path: "Path",
+        expected_sha256: str = "",
+    ) -> ChatTransportResult:
+        """Stage one local file on the composer of a verified conversation.
+
+        The digest is recomputed immediately before staging, not trusted from
+        whenever the caller last looked. A file that changed between validation
+        and delivery is refused rather than sent.
+        """
+        source = Path(path)
+        if not source.is_file():
+            return ChatTransportResult.deny("ATTACH_ARTIFACT", "attach-file-not-found", str(source))
+
+        data = source.read_bytes()
+        digest = hashlib.sha256(data).hexdigest()
+        if expected_sha256 and digest != expected_sha256:
+            return ChatTransportResult.deny(
+                "ATTACH_ARTIFACT", "attach-digest-mismatch",
+                f"expected {expected_sha256}, file is {digest}")
+
+        focused = self.focus(endpoint_id)
+        if not focused.ok:
+            return ChatTransportResult.deny("ATTACH_ARTIFACT", focused.reason_code, focused.detail)
+
+        state = self.driver.response_state()
+        if state.ok and state.data.get("state") == "streaming":
+            return ChatTransportResult.deny("ATTACH_ARTIFACT", "response-in-progress")
+
+        result = self.driver.attach_file(str(source))
+        if not result.ok:
+            return ChatTransportResult.deny(
+                "ATTACH_ARTIFACT", result.reason_code, str(result.get("detail", "")))
+
+        # The driver already confirmed the file is staged by name. Re-read it
+        # here so the adapter's own result reflects what the app reports rather
+        # than what the driver was asked to do.
+        staged = self.driver.attachment_state()
+        names = list(staged.data.get("attached", [])) if staged.ok else []
+        if source.name not in names:
+            return ChatTransportResult.deny(
+                "ATTACH_ARTIFACT", "attach-not-confirmed",
+                f"expected {source.name!r}, staged {names}")
+
+        return ChatTransportResult.allow("ATTACH_ARTIFACT", {
+            "endpoint_id": endpoint_id,
+            "filename": source.name,
+            "path": str(source),
+            "sha256": digest,
+            "size_bytes": len(data),
+            "staged": names,
+        })
+
+    def clear_attachments(self) -> ChatTransportResult:
+        result = self.driver.clear_attachments()
+        if not result.ok:
+            return ChatTransportResult.deny("ATTACH_ARTIFACT", result.reason_code)
+        return ChatTransportResult.allow("ATTACH_ARTIFACT", dict(result.data))
