@@ -54,6 +54,7 @@ class StubDriver:
         self.attached: List[str] = []
         self.attach_result = None
         self.transcript = ""
+        self.send_enabled_after_stage = True
         self.__dict__.update(overrides)
 
     def snapshot(self, chat_list_name=""):
@@ -72,7 +73,8 @@ class StubDriver:
     def set_message(self, text):
         self.calls.append("set_message")
         self.composer_text = text
-        return ok({"length": len(text), "method": "clipboard-paste"})
+        return ok({"length": len(text), "method": "uia-value",
+                   "send_enabled": self.send_enabled_after_stage})
 
     def read_composer(self):
         self.calls.append("read_composer")
@@ -257,6 +259,41 @@ class FocusTests(unittest.TestCase):
         result = build(StubDriver()).focus("some-chat-from-prose")
         self.assertFalse(result.ok)
         self.assertIn("endpoint-not-registered", result.reason_code)
+
+
+class StagingMechanismTests(unittest.TestCase):
+    """Staging must not depend on which window has focus."""
+
+    def test_CHAT_009_staging_prefers_the_keystroke_free_path(self):
+        driver = StubDriver()
+        adapter = build(driver)
+        adapter.stage_message("TOKEN body", verify_token="TOKEN")
+        # No foreground-dependent path is involved at all.
+        self.assertIn("set_message", driver.calls)
+
+    def test_CHAT_009b_a_composer_the_app_did_not_register_blocks_the_send(self):
+        """UIA can echo a value back that the editor model never took."""
+        driver = StubDriver()
+        driver.send_enabled_after_stage = False
+        result = build(driver).stage_message("TOKEN body", verify_token="TOKEN")
+        self.assertFalse(result.ok)
+        self.assertEqual(result.reason_code, "composer-not-registered-by-app")
+
+    def test_CHAT_009c_an_older_driver_without_the_signal_still_works(self):
+        """Absent field means unknown, which must not read as disabled."""
+        class Older(StubDriver):
+            def set_message(self, text):
+                self.calls.append("set_message")
+                self.composer_text = text
+                return ok({"length": len(text), "method": "clipboard-paste"})
+
+        result = build(Older()).stage_message("TOKEN body", verify_token="TOKEN")
+        self.assertTrue(result.ok, result.reason_code)
+
+    def test_CHAT_009d_driver_offers_a_separate_clear(self):
+        """Clearing is its own intent, never expressible as sending nothing."""
+        from standalone.bridge.uia import DRIVER_OPERATIONS
+        self.assertIn("clear_composer", DRIVER_OPERATIONS)
 
 
 class SendTests(unittest.TestCase):

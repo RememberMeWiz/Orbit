@@ -357,32 +357,85 @@ switch ($Operation) {
     }
     if ($null -eq $composer) { Fail "composer-not-found" }
 
-    $previousClipboard = $null
-    try { $previousClipboard = Get-Clipboard -Raw -ErrorAction SilentlyContinue } catch { }
-
-    $staged = $false
+    # Preferred path: write the value straight into the composer element.
+    #
+    # This is bound to the *element*, not to whatever window happens to hold
+    # focus, so it has none of the time-of-check/time-of-use exposure that any
+    # foreground-dependent keystroke inherits. It also touches no clipboard, so
+    # it cannot clobber whatever the operator had copied.
+    #
+    # Verified live before being made primary: ProseMirror genuinely registers
+    # the value rather than merely echoing it back through UIA -- the app's own
+    # Send button transitions disabled -> enabled -> disabled tracking the set,
+    # which is an independent signal that the editor model actually updated.
+    $method = ""
     try {
-      Set-Clipboard -Value $text
-      $composer.SetFocus()
-      Start-Sleep -Milliseconds 250
-      # Select-all then paste replaces any stale draft without pressing Enter.
-      # Both are refused outright unless the chat window is genuinely in front,
-      # because a select-all landing elsewhere would replace someone's work.
-      if (Send-KeysTo $hwnd "^a") {
-        Start-Sleep -Milliseconds 120
-        $staged = Send-KeysTo $hwnd "^v"
-        Start-Sleep -Milliseconds 450
+      $vp = $composer.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)
+      if (-not $vp.Current.IsReadOnly) {
+        $vp.SetValue($text)
+        Start-Sleep -Milliseconds 350
+        if ($vp.Current.Value -eq $text) { $method = "uia-value" }
       }
-    } catch {
-      Fail "composer-set-failed" $_.Exception.Message
-    } finally {
+    } catch { }
+
+    if (-not $method) {
+      # Fallback only. Clipboard paste needs the window in front, which is the
+      # exposure the primary path exists to avoid, so it is used only when the
+      # app stops offering a writable value pattern at all.
+      $previousClipboard = $null
+      try { $previousClipboard = Get-Clipboard -Raw -ErrorAction SilentlyContinue } catch { }
+      $staged = $false
       try {
-        if ($null -ne $previousClipboard) { Set-Clipboard -Value $previousClipboard }
-        else { Set-Clipboard -Value " " }
-      } catch { }
+        Set-Clipboard -Value $text
+        $composer.SetFocus()
+        Start-Sleep -Milliseconds 250
+        if (Send-KeysTo $hwnd "^a") {
+          Start-Sleep -Milliseconds 120
+          $staged = Send-KeysTo $hwnd "^v"
+          Start-Sleep -Milliseconds 450
+        }
+      } catch {
+        Fail "composer-set-failed" $_.Exception.Message
+      } finally {
+        try {
+          if ($null -ne $previousClipboard) { Set-Clipboard -Value $previousClipboard }
+          else { Set-Clipboard -Value " " }
+        } catch { }
+      }
+      if (-not $staged) { Fail "composer-window-not-foreground" }
+      $method = "clipboard-paste"
     }
-    if (-not $staged) { Fail "composer-window-not-foreground" }
-    Done @{ length = $text.Length; method = "clipboard-paste" }
+
+    # Whether the app itself considers the composer non-empty. A second,
+    # independent reading: the value could echo back while the editor model
+    # stayed empty, and then Send would transmit nothing.
+    $sendEnabled = $false
+    foreach ($e in (All-Descendants $w)) {
+      if ((CT $e) -eq "Button" -and (NM $e) -ceq "Send") {
+        try { $sendEnabled = [bool]$e.Current.IsEnabled } catch { }
+        break
+      }
+    }
+
+    Done @{ length = $text.Length; method = $method; send_enabled = $sendEnabled }
+  }
+
+  # Empty the composer. Separate from set_message, which refuses empty text --
+  # clearing is a distinct intent and must not be expressible as "send nothing".
+  "clear_composer" {
+    $w = Get-ChatWindow
+    $composer = $null
+    foreach ($e in (All-Descendants $w)) {
+      if ((CT $e) -eq "Edit" -and (ClassOf $e) -like "*ProseMirror*") { $composer = $e; break }
+    }
+    if ($null -eq $composer) { Fail "composer-not-found" }
+    try {
+      $vp = $composer.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)
+      if ($vp.Current.IsReadOnly) { Fail "composer-read-only" }
+      $vp.SetValue("")
+      Start-Sleep -Milliseconds 250
+      Done @{ cleared = $true; value = [string]$vp.Current.Value }
+    } catch { Fail "composer-clear-failed" $_.Exception.Message }
   }
 
   # Read the composer contents back so the caller can verify exactly what is

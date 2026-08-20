@@ -235,9 +235,30 @@ class ChatGptAdapter:
             # Typing into a composer mid-stream is how messages get interleaved
             # into the wrong turn.
             return ChatTransportResult.deny("SEND_BOUNDED_MESSAGE", "response-in-progress")
+
+        # Focus verified a composer, but a conversation switch tears one down and
+        # rebuilds it, so the gap between focusing and staging is long enough for
+        # it to be missing again. Wait for it rather than failing a delivery on a
+        # transition that resolves in a second.
+        composer = self.await_surface()
+        if not composer.ok:
+            return ChatTransportResult.deny("SEND_BOUNDED_MESSAGE", composer.reason_code,
+                                            composer.detail)
+
         result = self.driver.set_message(text)
         if not result.ok:
             return ChatTransportResult.deny("SEND_BOUNDED_MESSAGE", result.reason_code, str(result.get("detail", "")))
+
+        # The app's own Send button tracks whether the editor model considers
+        # the composer non-empty. Checked as well as the text read-back because
+        # the two can disagree: a value can echo back through the accessibility
+        # tree while the editor never registered it, and Send would then
+        # transmit nothing. Only asserted when the driver reports it, so an
+        # older driver degrades to the read-back alone rather than failing.
+        if "send_enabled" in result.data and not result.data.get("send_enabled"):
+            return ChatTransportResult.deny(
+                "SEND_BOUNDED_MESSAGE", "composer-not-registered-by-app",
+                f"staged via {result.data.get('method', 'unknown')} but Send stayed disabled")
 
         # Read the composer back. Paste can be swallowed by a re-render or land
         # in a different field; only the app's own report of its contents proves
@@ -418,6 +439,17 @@ class ChatGptAdapter:
             return ChatTransportResult.deny(
                 "COLLECT_EXPECTED_ARTIFACT", "artifact-not-materialised", str(destination))
 
+        return self._validate_collected(destination, expected_name, work_item, expected_sender)
+
+    def _validate_collected(self, destination: "Path", expected_name: str,
+                            work_item: str, expected_sender: str) -> ChatTransportResult:
+        """Identity checks on bytes that are already on disk.
+
+        Shared by both collection paths so a handoff read out of the transcript
+        is held to exactly the same standard as one saved from a file card. A
+        second, weaker set of rules for the easier path is how the easier path
+        becomes the way things get smuggled in.
+        """
         data = destination.read_bytes()
         digest = hashlib.sha256(data).hexdigest()
 

@@ -35,6 +35,7 @@ DRIVER_OPERATIONS = (
     "describe_control",
     "list_controls",
     "clear_attachments",
+    "clear_composer",
     "app_state",
     "launch_app",
 )
@@ -129,6 +130,9 @@ class UiaDriver:
 
     def set_message(self, text: str) -> UiaResult:
         return self.call("set_message", {"text": text})
+
+    def clear_composer(self) -> UiaResult:
+        return self.call("clear_composer")
 
     def read_composer(self) -> UiaResult:
         return self.call("read_composer")
