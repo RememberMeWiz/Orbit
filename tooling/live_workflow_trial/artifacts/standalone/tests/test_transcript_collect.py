@@ -17,19 +17,16 @@ from standalone.tests.test_chatgpt_adapter import StubDriver, build, ok
 WORK_ITEM = "M0-WF-TRANSCRIPT-TEST"
 ARTIFACT = "HANDOFF_M0-WF-TRANSCRIPT-TEST_WORKER_TO_ORBIT.md"
 
-# Plain values, no inline code: the accessibility tree splits a backticked
-# scalar onto its own line, which would arrive as a malformed header.
-HANDOFF = """# Worker Result
-
-## Header
-- Work Item: M0-WF-TRANSCRIPT-TEST
-- From: WORKER
-- To: ORBIT
-- Status: COMPLETE
-- Handoff ID: M0-WF-TRANSCRIPT-TEST-0001
-- Sequence: 1
-
-## Summary
+# Flat fields, not Markdown. The accessibility tree keeps plain text and drops
+# structure: "## Header" arrives as "Header" and the bullet list under it
+# disappears, which is exactly how the first live attempt failed.
+HANDOFF = """work_item: M0-WF-TRANSCRIPT-TEST
+from: WORKER
+to: ORBIT
+status: COMPLETE
+handoff_id: M0-WF-TRANSCRIPT-TEST-0001
+sequence: 1
+ORBIT_HANDOFF_BODY
 Returned in the conversation. No file, no work mode, no credits.
 """
 
@@ -105,12 +102,30 @@ class HappyPathTests(CollectBase):
             inbox_dir=self.inbox, work_item=WORK_ITEM)
         self.assertIn("focus_chat:Windows Workflow", driver.calls)
 
-    def test_TC_006_a_revised_handoff_supersedes_the_earlier_one(self):
-        first = HANDOFF.replace("Sequence: 1", "Sequence: 1\n- Note: first")
-        transcript = turn(first) + turn(HANDOFF)
-        result = self.collect(transcript)
-        self.assertTrue(result.ok, result.reason_code)
-        self.assertNotIn("first", Path(result.data["path"]).read_text(encoding="utf-8"))
+    def test_TC_006_a_second_eligible_block_is_ambiguous_not_a_revision(self):
+        """Recency proves the text came later, not that it is the handoff.
+
+        A worker that quotes, echoes, revises or demonstrates a handoff produces
+        a second complete candidate inside an assistant turn, where provenance
+        filtering cannot tell it apart from the real one.
+        """
+        first = HANDOFF.replace("No file, no work mode", "first draft")
+        result = self.collect(turn(first) + turn(HANDOFF))
+        self.assertFalse(result.ok)
+        self.assertEqual(result.reason_code, "transcript-handoff-ambiguous")
+        self.assertIn("eligible blocks", result.detail)
+
+    def test_TC_007_two_candidates_in_one_turn_are_also_ambiguous(self):
+        body = f"ORBIT_HANDOFF_BEGIN {ARTIFACT}\n{HANDOFF}ORBIT_HANDOFF_END\n"
+        result = self.collect("ChatGPT said:\nAs an example:\n" + body + "And the real one:\n" + body)
+        self.assertFalse(result.ok)
+        self.assertEqual(result.reason_code, "transcript-handoff-ambiguous")
+
+    def test_TC_008_collection_records_what_it_saw(self):
+        result = self.collect(turn(HANDOFF))
+        self.assertEqual(result.data["candidates_seen"], 1)
+        self.assertEqual(result.data["collected_from"], "windows-workflow")
+        self.assertEqual(result.data["rejected_candidates"], [])
 
 
 class ProvenanceTests(CollectBase):
@@ -140,15 +155,24 @@ class RefusalTests(CollectBase):
         self.assertFalse(result.ok)
         self.assertEqual(result.reason_code, "transcript-handoff-not-found")
 
-    def test_TC_022_a_missing_header_is_refused_and_leaves_no_file(self):
-        result = self.collect(turn("just some prose, no header at all\n"))
+    def test_TC_022_a_block_with_no_fields_is_not_a_handoff(self):
+        """Orbit renders the header it was given; it never invents one."""
+        result = self.collect(turn("just some prose, no fields at all\n"))
         self.assertFalse(result.ok)
-        self.assertIn("missing-formal-header", result.reason_code)
+        self.assertEqual(result.reason_code, "transcript-handoff-not-found")
         self.assertFalse((self.inbox / ARTIFACT).exists())
 
+    def test_TC_022b_a_block_missing_one_critical_field_is_refused(self):
+        for dropped in ("work_item", "from", "to", "status", "handoff_id", "sequence"):
+            partial = "\n".join(l for l in HANDOFF.splitlines()
+                                if not l.startswith(dropped + ":")) + "\n"
+            result = self.collect(turn(partial))
+            self.assertFalse(result.ok, dropped)
+            self.assertEqual(result.reason_code, "transcript-handoff-not-found", dropped)
+
     def test_TC_023_a_header_for_another_work_item_is_refused(self):
-        wrong = HANDOFF.replace("- Work Item: M0-WF-TRANSCRIPT-TEST",
-                                "- Work Item: SOME-OTHER-ITEM")
+        wrong = HANDOFF.replace("work_item: M0-WF-TRANSCRIPT-TEST",
+                                "work_item: SOME-OTHER-ITEM")
         result = self.collect(turn(wrong))
         self.assertFalse(result.ok)
         self.assertEqual(result.reason_code, "artifact-header-work-item-mismatch")
@@ -181,10 +205,75 @@ class RefusalTests(CollectBase):
         self.assertFalse(again.ok)
         self.assertEqual(again.reason_code, "artifact-already-collected")
 
-    def test_TC_029_an_invalid_body_does_not_stay_in_the_inbox(self):
-        """A rejected file left behind would look collected to the next run."""
-        self.collect(turn("no header here\n"))
+    def test_TC_029_a_body_rejected_by_the_validator_does_not_stay_in_the_inbox(self):
+        """It is written before it is validated, so it must be removed after.
+
+        A rejected file left behind would look collected to the next run, and
+        `artifact-already-collected` would then refuse the real one.
+        """
+        wrong = HANDOFF.replace("work_item: M0-WF-TRANSCRIPT-TEST",
+                                "work_item: SOME-OTHER-ITEM")
+        result = self.collect(turn(wrong))
+        self.assertEqual(result.reason_code, "artifact-header-work-item-mismatch")
         self.assertFalse((self.inbox / ARTIFACT).exists())
+        # ...and the real one can still be collected afterwards.
+        self.assertTrue(self.collect(turn(HANDOFF)).ok)
+
+    def test_TC_030_markdown_structure_is_never_asked_of_the_worker(self):
+        """The channel drops headings and bullets, so Orbit writes them itself."""
+        import standalone.bridge.chatgpt as mod
+
+        rendered, problems = mod._handoff_candidates(
+            f"ORBIT_HANDOFF_BEGIN {ARTIFACT}\n{HANDOFF}ORBIT_HANDOFF_END\n", ARTIFACT)
+        self.assertEqual(problems, [])
+        self.assertIn("## Header", rendered[0])
+        self.assertIn("- Work Item: M0-WF-TRANSCRIPT-TEST", rendered[0])
+        # None of that Markdown came from the worker's own text.
+        self.assertNotIn("## Header", HANDOFF)
+        self.assertNotIn("- Work Item", HANDOFF)
+
+    def test_TC_031_an_end_marker_inside_the_body_is_refused(self):
+        """A body discussing the protocol would otherwise truncate itself.
+
+        The header stays valid, so validation passes and the findings are
+        silently lost — the worst kind of failure.
+        """
+        # The marker alone on its own line is the realistic hazard: a body that
+        # quotes the protocol truncates the handoff after a still-valid header.
+        talkative = HANDOFF + "as in:\nORBIT_HANDOFF_END\nmore findings\n"
+        result = self.collect(turn(talkative))
+        self.assertFalse(result.ok)
+        self.assertEqual(result.reason_code, "transcript-handoff-not-found")
+        self.assertIn("embedded-end-marker", result.detail)
+
+    def test_TC_032_a_second_body_marker_is_refused(self):
+        confused = HANDOFF + "ORBIT_HANDOFF_BODY\nwhich half is the body?\n"
+        result = self.collect(turn(confused))
+        self.assertFalse(result.ok)
+        self.assertIn("embedded-body-marker", result.detail)
+
+    def test_TC_033_a_rejected_body_is_quarantined_with_its_reason(self):
+        """The only reconstruction is the evidence; deleting it destroys that."""
+        import json
+
+        wrong = HANDOFF.replace("work_item: M0-WF-TRANSCRIPT-TEST",
+                                "work_item: SOME-OTHER-ITEM")
+        self.collect(turn(wrong))
+        quarantine = self.inbox.parent / "quarantine"
+        rejected = list(quarantine.glob(f"{ARTIFACT}.*.rejected"))
+        reasons = list(quarantine.glob(f"{ARTIFACT}.*.reason.json"))
+        self.assertEqual(len(rejected), 1)
+        self.assertIn("SOME-OTHER-ITEM", rejected[0].read_text(encoding="utf-8"))
+        payload = json.loads(reasons[0].read_text(encoding="utf-8"))
+        self.assertEqual(payload["reason_code"], "artifact-header-work-item-mismatch")
+        self.assertEqual(payload["endpoint_id"], "windows-workflow")
+
+    def test_TC_034_quarantine_is_outside_the_inbox(self):
+        """Anything inside the inbox could be mistaken for authority."""
+        wrong = HANDOFF.replace("work_item: M0-WF-TRANSCRIPT-TEST",
+                                "work_item: SOME-OTHER-ITEM")
+        self.collect(turn(wrong))
+        self.assertEqual(list(self.inbox.glob("*")), [])
 
 
 if __name__ == "__main__":

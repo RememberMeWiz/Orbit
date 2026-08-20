@@ -13,6 +13,7 @@ ever selected from message text, and no operation accepts a coordinate.
 """
 from __future__ import annotations
 
+import json
 import re
 import time
 from dataclasses import dataclass
@@ -23,6 +24,7 @@ import io
 import zipfile
 from pathlib import Path
 
+from workflow.core.storage import utc_now_iso
 from workflow.core.validation import NAME_RE, parse_header
 
 from .contracts import ChatEndpoint, ChatTransportResult
@@ -44,11 +46,29 @@ IDLE_CONFIRM_SECONDS = 6.0
 STAGE_VERIFY_SECONDS = 8.0
 
 # Delimiters for a handoff returned in the conversation itself rather than as a
-# downloadable file. Plain lines on purpose: the accessibility tree fragments a
-# syntax-highlighted code block into one node per token, so anything relying on
-# fences or inline code would arrive shredded.
-_HANDOFF_BEGIN_RE = re.compile(r"(?m)^[ \t]*ORBIT_HANDOFF_BEGIN[ \t]+(?P<name>\S+)[ \t]*$")
-_HANDOFF_END_RE = re.compile(r"(?m)^[ \t]*ORBIT_HANDOFF_END[ \t]*$")
+# downloadable file.
+#
+# Flat `key: value` lines, not Markdown. Verified against the live app: the
+# accessibility tree keeps plain text and drops structure, so "## Header"
+# arrives as "Header" and the bullet list under it disappears entirely. The
+# ORBIT_DIRECTIVE envelope survives the same channel intact precisely because it
+# is flat, so a handoff uses the same shape and Orbit renders the canonical
+# Markdown locally. Transporting a format the channel cannot carry, and hoping,
+# is how you get a header that silently means something other than it says.
+_HANDOFF_BEGIN_RE = re.compile(r"(?m)^[ 	]*ORBIT_HANDOFF_BEGIN[ 	]+(?P<name>\S+)[ 	]*$")
+_HANDOFF_BODY_RE = re.compile(r"(?m)^[ 	]*ORBIT_HANDOFF_BODY[ 	]*$")
+_HANDOFF_END_RE = re.compile(r"(?m)^[ 	]*ORBIT_HANDOFF_END[ 	]*$")
+_HANDOFF_FIELD_RE = re.compile(r"^[ 	]*([A-Za-z_][A-Za-z0-9_]*)[ 	]*:[ 	]*(.*?)[ 	]*$")
+
+# Flat field name -> the canonical header label Orbit writes for it.
+_HANDOFF_FIELD_LABELS = {
+    "work_item": "Work Item",
+    "from": "From",
+    "to": "To",
+    "status": "Status",
+    "handoff_id": "Handoff ID",
+    "sequence": "Sequence",
+}
 
 
 @dataclass
@@ -517,6 +537,33 @@ class ChatGptAdapter:
             "sequence": fields.get("sequence"),
         })
 
+    def _quarantine(self, path: "Path", expected_name: str,
+                    reason_code: str, endpoint_id: str) -> None:
+        """Move a rejected reconstruction out of the inbox, keeping the evidence.
+
+        Deleting it is safe but unhelpful: it destroys the only record of what
+        actually arrived, which is precisely what tells a human whether the
+        worker wrote something malformed or the accessibility bridge mangled it
+        in transit. Quarantine sits outside the inbox and carries no authority.
+        """
+        try:
+            folder = path.parent.parent / "quarantine"
+            folder.mkdir(parents=True, exist_ok=True)
+            stamp = utc_now_iso().replace(":", "-")
+            folder.joinpath(f"{expected_name}.{stamp}.rejected").write_bytes(path.read_bytes())
+            folder.joinpath(f"{expected_name}.{stamp}.reason.json").write_text(
+                json.dumps({"expected_name": expected_name, "reason_code": reason_code,
+                            "endpoint_id": endpoint_id, "collected_at": utc_now_iso(),
+                            "source": "transcript"}, indent=2, sort_keys=True),
+                encoding="utf-8")
+        except OSError:
+            pass                      # evidence is best-effort, never a blocker
+        finally:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
     def collect_from_transcript(
         self,
         *,
@@ -565,11 +612,28 @@ class ChatGptAdapter:
         if not tail.ok:
             return ChatTransportResult.deny("COLLECT_EXPECTED_ARTIFACT", tail.reason_code)
 
-        bodies = [b for turn in assistant_turns(str(tail.data.get("text", "")))
-                  for b in _handoff_blocks(turn, expected_name)]
-        if not bodies:
+        candidates: List[str] = []
+        problems: List[str] = []
+        for turn in assistant_turns(str(tail.data.get("text", ""))):
+            found, trouble = _handoff_candidates(turn, expected_name)
+            candidates.extend(found)
+            problems.extend(trouble)
+
+        if not candidates:
             return ChatTransportResult.deny(
-                "COLLECT_EXPECTED_ARTIFACT", "transcript-handoff-not-found", expected_name)
+                "COLLECT_EXPECTED_ARTIFACT", "transcript-handoff-not-found",
+                "; ".join(problems) if problems else expected_name)
+
+        # Exactly one, or nothing. Recency proves only that text came later, not
+        # that it is the intended handoff -- and an assistant that quotes,
+        # echoes, revises or demonstrates a handoff produces a second complete
+        # candidate inside an assistant turn, where provenance filtering cannot
+        # tell it apart. Ambiguity is an error here for the same reason it is
+        # when two chats resolve to one endpoint.
+        if len(candidates) > 1:
+            return ChatTransportResult.deny(
+                "COLLECT_EXPECTED_ARTIFACT", "transcript-handoff-ambiguous",
+                f"{len(candidates)} eligible blocks named {expected_name}")
 
         inbox = Path(inbox_dir)
         inbox.mkdir(parents=True, exist_ok=True)
@@ -578,18 +642,20 @@ class ChatGptAdapter:
             return ChatTransportResult.deny(
                 "COLLECT_EXPECTED_ARTIFACT", "artifact-already-collected", str(destination))
 
-        # Newest wins, matching how a directive is read: the latest thing the
-        # worker wrote is the one that counts if it revised its answer.
-        destination.write_text(bodies[-1], encoding="utf-8")
+        destination.write_text(candidates[0], encoding="utf-8")
         result = self._validate_collected(destination, expected_name, work_item, expected_sender)
         if not result.ok:
-            # Do not leave an invalid file sitting in the inbox looking collected.
-            try:
-                destination.unlink()
-            except OSError:
-                pass
+            # Out of the authoritative inbox, but not destroyed: whether the
+            # worker emitted malformed text or the bridge corrupted it in
+            # transit is exactly what someone will need to look at, and the only
+            # reconstructed copy is the evidence. Quarantine carries no
+            # workflow authority.
+            self._quarantine(destination, expected_name, result.reason_code, endpoint_id)
             return result
         result.data["source"] = "transcript"
+        result.data["candidates_seen"] = len(candidates)
+        result.data["rejected_candidates"] = problems
+        result.data["collected_from"] = endpoint_id
         return result
 
     def attach_artifact(
@@ -759,22 +825,67 @@ class ChatGptAdapter:
         }, delivery_state="SENT_UNCONFIRMED")
 
 
-def _handoff_blocks(text: str, expected_name: str) -> List[str]:
-    """Every complete, correctly-named handoff block in one turn, oldest first.
+def _handoff_candidates(text: str, expected_name: str) -> "tuple[List[str], List[str]]":
+    """Eligible handoffs in one turn, plus reasons any were rejected outright.
 
-    An unterminated block is skipped rather than read to the end of the turn: a
-    worker whose message was cut off has not delivered a handoff, and treating
-    the remaining transcript as its body would invent one.
+    A file card is a discrete object selected by name. Transcript text has no
+    equally strong boundary, so the boundary is enforced here instead of
+    inferred: a candidate runs from its BEGIN marker to the single END marker
+    before the next BEGIN, and anything less tidy than that is refused rather
+    than recovered.
+
+    Specifically refused, each because it can pass validation while meaning
+    something other than it says:
+
+    * two END markers in one region -- a body discussing the protocol can
+      contain a literal END line, truncating the handoff after a still-valid
+      header so the findings are silently lost;
+    * a BEGIN with no END -- a message that was cut off has delivered nothing;
+    * more than one BODY marker -- the header/body split becomes a guess.
     """
-    blocks: List[str] = []
-    for begin in _HANDOFF_BEGIN_RE.finditer(text):
+    rendered: List[str] = []
+    problems: List[str] = []
+
+    begins = list(_HANDOFF_BEGIN_RE.finditer(text))
+    for index, begin in enumerate(begins):
+        stop = begins[index + 1].start() if index + 1 < len(begins) else len(text)
+        region = text[begin.end():stop]
+
         if begin.group("name") != expected_name:
+            continue                      # a different artifact, not a problem
+
+        ends = list(_HANDOFF_END_RE.finditer(region))
+        if not ends:
+            problems.append("unterminated")
             continue
-        rest = text[begin.end():]
-        end = _HANDOFF_END_RE.search(rest)
-        if not end:
+        if len(ends) > 1:
+            problems.append("embedded-end-marker")
             continue
-        body = rest[:end.start()].strip("\r\n")
-        if body.strip():
-            blocks.append(body + "\n")
-    return blocks
+
+        block = region[:ends[0].start()]
+        splits = list(_HANDOFF_BODY_RE.finditer(block))
+        if len(splits) > 1:
+            problems.append("embedded-body-marker")
+            continue
+        head, body = ((block[:splits[0].start()], block[splits[0].end():])
+                      if splits else (block, ""))
+
+        fields = {}
+        for line in head.splitlines():
+            if not line.strip():
+                continue
+            match = _HANDOFF_FIELD_RE.match(line)
+            if match:
+                fields.setdefault(match.group(1).strip().lower(), match.group(2).strip())
+
+        missing = [key for key in _HANDOFF_FIELD_LABELS if not fields.get(key)]
+        if missing:
+            problems.append("missing-fields:" + ",".join(missing))
+            continue
+
+        lines = ["# " + expected_name, "", "## Header"]
+        lines += [f"- {label}: {fields[key]}" for key, label in _HANDOFF_FIELD_LABELS.items()]
+        lines += ["", "## Summary", body.strip() or "(no body supplied)", ""]
+        rendered.append(chr(10).join(lines))
+
+    return rendered, problems
