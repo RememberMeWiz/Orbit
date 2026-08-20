@@ -290,5 +290,49 @@ class DriverSurfaceTests(unittest.TestCase):
             self.assertNotIn("click", op)
 
 
+class DriverParsingTests(unittest.TestCase):
+    """Both of these were live failures, not hypotheticals."""
+
+    def _driver(self, stdout: str):
+        from types import SimpleNamespace
+        from standalone.bridge.uia import UiaDriver
+
+        def runner(argv, **kwargs):
+            self.kwargs = kwargs
+            return SimpleNamespace(stdout=stdout, stderr="", returncode=0)
+
+        return UiaDriver(runner=runner)
+
+    def test_DRV_001_wrapped_json_is_parsed(self):
+        """PowerShell wraps long output across lines; that is not a failure."""
+        payload = '{"ok":true,"reason_code":"ok","data":{"text":"abc",' + chr(10) + '"nodes":3}}'
+        result = self._driver(payload).call("snapshot", {})
+        self.assertTrue(result.ok)
+        self.assertEqual(result.data["nodes"], 3)
+
+    def test_DRV_002_utf8_is_requested_explicitly(self):
+        """Conversation text is not ASCII; the locale codepage corrupts it."""
+        self._driver('{"ok":true,"reason_code":"ok"}').call("snapshot", {})
+        self.assertEqual(self.kwargs.get("encoding"), "utf-8")
+        self.assertEqual(self.kwargs.get("errors"), "replace")
+
+    def test_DRV_003_non_ascii_payload_survives(self):
+        payload = '{"ok":true,"reason_code":"ok","data":{"text":"Write in Markdown… — café"}}'
+        result = self._driver(payload).call("read_transcript_tail", {})
+        self.assertTrue(result.ok)
+        self.assertIn("caf", result.data["text"])
+
+    def test_DRV_004_stdin_is_closed(self):
+        """An interactive prompt would hang the driver forever."""
+        import subprocess
+        self._driver('{"ok":true,"reason_code":"ok"}').call("snapshot", {})
+        self.assertEqual(self.kwargs.get("stdin"), subprocess.DEVNULL)
+
+    def test_DRV_005_garbage_is_a_denial_not_an_exception(self):
+        result = self._driver("not json at all").call("snapshot", {})
+        self.assertFalse(result.ok)
+        self.assertEqual(result.reason_code, "driver-unparseable-output")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

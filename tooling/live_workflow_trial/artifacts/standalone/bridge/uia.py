@@ -28,6 +28,7 @@ DRIVER_OPERATIONS = (
     "list_artifacts",
     "response_state",
     "press_send",
+    "read_transcript_tail",
 )
 
 
@@ -74,6 +75,7 @@ class UiaDriver:
         try:
             completed = self._runner(
                 argv, capture_output=True, text=True,
+                encoding="utf-8", errors="replace",
                 timeout=self.timeout, stdin=subprocess.DEVNULL,
             )
         except subprocess.TimeoutExpired:
@@ -82,6 +84,8 @@ class UiaDriver:
             return _deny("driver-not-runnable", str(exc)[:200])
 
         stdout = (completed.stdout or "").strip()
+
+        # Fast path: the compact JSON arrived on its own line.
         for line in reversed(stdout.splitlines()):
             line = line.strip()
             if line.startswith("{"):
@@ -89,6 +93,19 @@ class UiaDriver:
                     return UiaResult(json.loads(line))
                 except json.JSONDecodeError:
                     continue
+
+        # PowerShell's formatter wraps long output across lines, so a large
+        # payload arrives as one JSON object split over many lines. Rejoin and
+        # parse the outermost object rather than treating wrapping as failure.
+        first, last = stdout.find("{"), stdout.rfind("}")
+        if first != -1 and last > first:
+            candidate = stdout[first:last + 1]
+            for attempt in (candidate, candidate.replace("\r", "").replace("\n", "")):
+                try:
+                    return UiaResult(json.loads(attempt))
+                except json.JSONDecodeError:
+                    continue
+
         return _deny("driver-unparseable-output", ((completed.stderr or stdout) or "")[:300])
 
     # -- convenience wrappers -------------------------------------------
@@ -116,3 +133,6 @@ class UiaDriver:
 
     def press_send(self) -> UiaResult:
         return self.call("press_send")
+
+    def read_transcript_tail(self, max_chars: int = 6000) -> UiaResult:
+        return self.call("read_transcript_tail", {"max_chars": max_chars})

@@ -14,6 +14,9 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+# Conversation text is not ASCII. Emit UTF-8 so the JSON survives the pipe;
+# the locale codepage mangles non-ASCII and produces invalid JSON.
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
 Add-Type -AssemblyName System.Windows.Forms
@@ -307,6 +310,33 @@ switch ($Operation) {
     if (-not (Invoke-Element $send)) { Fail "send-not-invokable" }
     Start-Sleep -Milliseconds 700
     Done @{ sent = $true }
+  }
+
+  # Read the tail of the currently open conversation so Orbit can find a PM
+  # directive addressed to it. Scoped to the response Document of the verified
+  # window: it reads the conversation Orbit already focused, nothing else, and
+  # returns only a bounded tail rather than the whole history.
+  "read_transcript_tail" {
+    $w = Get-ChatWindow
+    $maxChars = 6000
+    if ($P.max_chars) { $maxChars = [int]$P.max_chars }
+
+    $doc = $null
+    foreach ($e in (All-Descendants $w)) {
+      if ((CT $e) -eq "Document") { $doc = $e; break }
+    }
+    if ($null -eq $doc) { Fail "response-document-not-found" }
+
+    $parts = @()
+    foreach ($e in $doc.FindAll($Scope::Descendants, $Cond::TrueCondition)) {
+      if ((CT $e) -ne "Text") { continue }
+      $n = ""
+      try { $n = $e.Current.Name } catch { }
+      if ($n) { $parts += $n }
+    }
+    $joined = ($parts -join "`n")
+    $tail = if ($joined.Length -gt $maxChars) { $joined.Substring($joined.Length - $maxChars) } else { $joined }
+    Done @{ text = $tail; total_length = $joined.Length; nodes = $parts.Count; truncated = ($joined.Length -gt $maxChars) }
   }
 
   default { Fail "operation-not-supported" $Operation }
