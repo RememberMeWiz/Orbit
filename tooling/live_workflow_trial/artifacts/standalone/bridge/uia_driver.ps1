@@ -80,6 +80,31 @@ function Bring-ChatToFront([IntPtr]$hwnd) {
   } catch { return $false }
 }
 
+# Keystrokes go to whatever window currently has focus, not to whatever element
+# UIA last touched. SetFocus on a background window does NOT make that window
+# foreground, so a Ctrl+A / Ctrl+V pair issued while ChatGPT is behind the
+# operator's editor performs select-all-and-replace *in the editor*.
+#
+# So no keystroke is ever sent blind. The intended window must be verifiably in
+# front at the moment of sending; if it cannot be raised, the operation fails
+# and sends nothing. Refusing to type is always recoverable. Typing into the
+# wrong window may not be.
+function Send-KeysTo([IntPtr]$hwnd, [string]$keys) {
+  if ($hwnd -eq [IntPtr]::Zero) { return $false }
+  if ([OrbitCursor]::GetForegroundWindow() -ne $hwnd) {
+    if (-not (Bring-ChatToFront $hwnd)) { return $false }
+  }
+  # Re-checked immediately before sending: the foreground can change between
+  # the raise and the keystroke, and that gap is the whole hazard.
+  if ([OrbitCursor]::GetForegroundWindow() -ne $hwnd) { return $false }
+  try { [System.Windows.Forms.SendKeys]::SendWait($keys) } catch { return $false }
+  return $true
+}
+
+function HandleOf($e) {
+  try { return [IntPtr]([int]$e.Current.NativeWindowHandle) } catch { return [IntPtr]::Zero }
+}
+
 function Click-ElementGeometry($e, [int]$expectedPid) {
   try {
     # A coordinate click goes wherever the pointer is, so it is only safe when
@@ -304,6 +329,7 @@ switch ($Operation) {
   # restored around the paste.
   "set_message" {
     $w = Get-ChatWindow
+    $hwnd = HandleOf $w
     $text = [string]$P.text
     if (-not $text) { Fail "message-empty" }
 
@@ -316,15 +342,19 @@ switch ($Operation) {
     $previousClipboard = $null
     try { $previousClipboard = Get-Clipboard -Raw -ErrorAction SilentlyContinue } catch { }
 
+    $staged = $false
     try {
       Set-Clipboard -Value $text
       $composer.SetFocus()
       Start-Sleep -Milliseconds 250
       # Select-all then paste replaces any stale draft without pressing Enter.
-      [System.Windows.Forms.SendKeys]::SendWait("^a")
-      Start-Sleep -Milliseconds 120
-      [System.Windows.Forms.SendKeys]::SendWait("^v")
-      Start-Sleep -Milliseconds 450
+      # Both are refused outright unless the chat window is genuinely in front,
+      # because a select-all landing elsewhere would replace someone's work.
+      if (Send-KeysTo $hwnd "^a") {
+        Start-Sleep -Milliseconds 120
+        $staged = Send-KeysTo $hwnd "^v"
+        Start-Sleep -Milliseconds 450
+      }
     } catch {
       Fail "composer-set-failed" $_.Exception.Message
     } finally {
@@ -333,6 +363,7 @@ switch ($Operation) {
         else { Set-Clipboard -Value " " }
       } catch { }
     }
+    if (-not $staged) { Fail "composer-window-not-foreground" }
     Done @{ length = $text.Length; method = "clipboard-paste" }
   }
 
@@ -488,10 +519,14 @@ switch ($Operation) {
       if ($dlg) { break }
     }
     if ($null -eq $dlg) { Fail "save-dialog-did-not-appear" }
+    $dlgHwnd = HandleOf $dlg
 
     function FailDlg([string]$code, [string]$detail = "") {
       try { $dlg.SetFocus(); Start-Sleep -Milliseconds 200 } catch { }
-      try { [System.Windows.Forms.SendKeys]::SendWait("{ESC}"); Start-Sleep -Milliseconds 600 } catch { }
+      # Escape is only pressed if the dialog is genuinely in front. If it is
+      # not, the dialog is left open for a human rather than dismissing
+      # whatever else is.
+      try { [void](Send-KeysTo $dlgHwnd "{ESC}"); Start-Sleep -Milliseconds 600 } catch { }
       Fail $code $detail
     }
 
@@ -521,10 +556,11 @@ switch ($Operation) {
       # readback below is what makes this safe -- if focus were anywhere else,
       # verification fails and nothing is committed.
       Start-Sleep -Milliseconds 350
-      [System.Windows.Forms.SendKeys]::SendWait("^a")
-      Start-Sleep -Milliseconds 150
-      [System.Windows.Forms.SendKeys]::SendWait("^v")
-      Start-Sleep -Milliseconds 500
+      if (Send-KeysTo $dlgHwnd "^a") {
+        Start-Sleep -Milliseconds 150
+        $pathPasted = Send-KeysTo $dlgHwnd "^v"
+        Start-Sleep -Milliseconds 500
+      }
     } catch {
       try { if ($null -ne $previousClipboard) { Set-Clipboard -Value $previousClipboard } } catch { }
       FailDlg "save-dialog-path-not-writable" $_.Exception.Message
@@ -558,7 +594,10 @@ switch ($Operation) {
       $committed = $true
     } catch { }
     if (-not $committed) {
-      try { [System.Windows.Forms.SendKeys]::SendWait("{ENTER}") } catch { FailDlg "save-dialog-commit-failed" $_.Exception.Message }
+      # Enter commits. It is only pressed with the dialog verifiably in front,
+      # since the same keystroke sent anywhere else activates that window's
+      # default action instead.
+      if (-not (Send-KeysTo $dlgHwnd "{ENTER}")) { FailDlg "save-dialog-not-foreground" }
     }
 
     # The dialog closing is the app's own signal that it accepted the path.
@@ -608,6 +647,7 @@ switch ($Operation) {
   # verified in the UI first.
   "attach_file" {
     $w = Get-ChatWindow
+    $hwnd = HandleOf $w
     $path = [string]$P.path
     if (-not $path) { Fail "attach-missing-path" }
     if (-not (Test-Path -LiteralPath $path)) { Fail "attach-file-not-found" $path }
@@ -632,8 +672,12 @@ switch ($Operation) {
 
       $composer.SetFocus()
       Start-Sleep -Milliseconds 300
-      [System.Windows.Forms.SendKeys]::SendWait("^v")
+      $pasted = Send-KeysTo $hwnd "^v"
       Start-Sleep -Milliseconds 1500
+      if (-not $pasted) {
+        try { if ($null -ne $previousClipboard) { Set-Clipboard -Value $previousClipboard } } catch { }
+        Fail "attach-window-not-foreground"
+      }
     } catch {
       try { if ($null -ne $previousClipboard) { Set-Clipboard -Value $previousClipboard } } catch { }
       Fail "attach-clipboard-paste-failed" $_.Exception.Message

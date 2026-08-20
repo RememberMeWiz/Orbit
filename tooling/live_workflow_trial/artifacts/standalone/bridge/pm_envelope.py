@@ -21,7 +21,7 @@ import json
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from workflow.core.storage import atomic_write_json, utc_now_iso
 
@@ -43,6 +43,8 @@ _BLOCK_RE = re.compile(
     re.DOTALL | re.IGNORECASE,
 )
 _FIELD_RE = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(.*?)\s*$")
+# A value still wearing its <angle brackets> was never filled in.
+_PLACEHOLDER_RE = re.compile(r"^<.*>?$|^<")
 
 
 class DirectiveError(ValueError):
@@ -146,21 +148,21 @@ class DirectiveVerdict:
     detail: str = ""
 
 
-def parse_envelope(text: str) -> Tuple[Optional[PMDirective], str]:
-    """Extract a directive from PM chat text, or say why there isn't one."""
-    if not text:
-        return None, "directive-absent"
-    match = _BLOCK_RE.search(text)
-    if match:
-        body = match.group("body")
-    else:
-        # Accept a bare block too, but only when the marker starts a line: prose
-        # that merely mentions the word must not be mistaken for an envelope.
-        idx = re.search(r"(?m)^\s*" + ENVELOPE_MARKER + r"\s*$", text)
-        if not idx:
-            return None, "directive-absent"
-        body = text[idx.end():]
+def _candidate_bodies(text: str) -> List[str]:
+    """Every stretch of text that could be an envelope, oldest first.
 
+    A transcript is an append-only log of a whole conversation, so the marker
+    appears many times: in prose, in the reply template Orbit itself posted, and
+    finally in PM's actual answer. All of them are collected here; choosing
+    between them is the caller's job.
+    """
+    bodies = [m.group("body") for m in _BLOCK_RE.finditer(text)]
+    bodies.extend(text[m.end():] for m in
+                  re.finditer(r"(?m)^\s*" + ENVELOPE_MARKER + r"\s*$", text))
+    return bodies
+
+
+def _parse_one(body: str) -> Tuple[Optional[PMDirective], str]:
     fields: Dict[str, str] = {}
     for line in body.splitlines():
         if not line.strip():
@@ -175,6 +177,15 @@ def parse_envelope(text: str) -> Tuple[Optional[PMDirective], str]:
     version = fields.get("version", "")
     if version and version != ENVELOPE_VERSION:
         return None, f"directive-version-unsupported:{version}"
+
+    # Orbit's own request carries a reply template, so the transcript always
+    # contains an envelope shaped exactly like a directive but filled with
+    # <angle-bracketed> placeholders. Reading that back as a decision would be
+    # Orbit taking instruction from itself, so placeholders are refused outright
+    # -- which also catches a PM who pasted the template without editing it.
+    unfilled = sorted(k for k, v in fields.items() if _PLACEHOLDER_RE.match(v))
+    if unfilled:
+        return None, "directive-template-not-filled-in:" + ",".join(unfilled)
 
     required = ("request_id", "directive_id", "work_item", "action")
     missing = [k for k in required if not fields.get(k)]
@@ -194,6 +205,36 @@ def parse_envelope(text: str) -> Tuple[Optional[PMDirective], str]:
         artifact_id=fields.get("artifact_id", ""),
         notes=fields.get("notes", ""),
     ), "directive-parsed"
+
+
+def parse_envelope(text: str) -> Tuple[Optional[PMDirective], str]:
+    """Extract PM's most recent decision, or say why there isn't one.
+
+    Scanned newest-first, because a transcript accumulates: Orbit's own request
+    and its reply template sit above PM's answer, and the app's accessibility
+    tree fragments a syntax-highlighted code block across lines, so the older
+    candidates are usually malformed. Taking the first match meant Orbit read
+    its own template and reported PM as having answered badly.
+
+    A malformed candidate is therefore skipped rather than fatal. Only when
+    nothing parses is a reason returned, and it is the newest candidate's --
+    that is the one PM most likely just wrote.
+    """
+    if not text:
+        return None, "directive-absent"
+
+    bodies = _candidate_bodies(text)
+    if not bodies:
+        return None, "directive-absent"
+
+    newest_reason = "directive-absent"
+    for index, body in enumerate(reversed(bodies)):
+        directive, reason = _parse_one(body)
+        if directive is not None:
+            return directive, reason
+        if index == 0:
+            newest_reason = reason
+    return None, newest_reason
 
 
 class PMBridgeState:
