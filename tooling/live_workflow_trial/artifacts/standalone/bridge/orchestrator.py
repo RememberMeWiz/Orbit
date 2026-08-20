@@ -77,10 +77,37 @@ class ApprenticeLoop:
     def stopped(self) -> bool:
         return bool(self.stop_path and self.stop_path.is_file())
 
-    def _machine_note(self) -> str:
-        return ("\n\nPosted by the Orbit local program through the ChatGPT desktop "
-                "accessibility bridge. No file was carried by the Product Owner.\n"
-                "Reply with an ORBIT_DIRECTIVE envelope quoting the request_id above.")
+    def _machine_note(self, request: "PMRequest") -> str:
+        """Say exactly what a usable answer looks like.
+
+        A request that only says "reply with a directive" makes PM guess at the
+        schema and at the endpoint slugs, and a guess fails closed here -- which
+        reads as Orbit being broken rather than as the answer being malformed.
+        So the reply template is spelled out, with the endpoints Orbit will
+        actually accept. The list is advisory: every field is still re-validated,
+        and a directive naming anything else is refused exactly as before.
+        """
+        try:
+            targets = self.adapter.registry.enabled_ids()
+        except Exception:
+            targets = []
+        target_line = " | ".join(targets) if targets else "<registered endpoint id>"
+        template = "\n".join([
+            "ORBIT_DIRECTIVE",
+            "version: 0.1",
+            f"request_id: {request.request_id}",
+            "directive_id: <new unique id for this decision>",
+            f"work_item: {self.work_item}",
+            f"action: <{' | '.join(request.safe_actions)}>",
+            f"target_endpoint: <{target_line}>",
+        ])
+        return (
+            "\n\nPosted by the Orbit local program through the ChatGPT desktop "
+            "accessibility bridge. No file was carried by the Product Owner.\n\n"
+            "Reply with this envelope in a fenced code block, filling in the "
+            "angle-bracketed values and leaving request_id exactly as shown:\n\n"
+            "```\n" + template + "\n```"
+        )
 
     # -- wake PM ---------------------------------------------------------
 
@@ -105,7 +132,7 @@ class ApprenticeLoop:
             workflow_state=workflow_state or {}, artifact_id=artifact_id,
             artifact_digest=artifact_digest, safe_actions=safe_actions,
         )
-        body = request.render() + self._machine_note()
+        body = request.render() + self._machine_note(request)
 
         result = self.adapter.deliver(
             ledger=self.ledger,

@@ -84,6 +84,40 @@ class WakeTests(LoopBase):
         self.assertEqual(out.action, "WAKE_FAILED")
         self.assertIsNone(loop.pm_state.load()["pending_request"])
 
+    def test_LOOP_004_the_request_shows_pm_exactly_how_to_answer(self):
+        """PM must not need out-of-band knowledge of the envelope schema."""
+        loop = self.loop()
+        out = loop.wake_pm(reason="bridge-online", nonce="n1")
+        posted = self.driver.composer_text
+
+        self.assertIn("ORBIT_PM_REQUEST", posted)
+        self.assertIn("ORBIT_DIRECTIVE", posted)
+        for field in ("version:", "request_id:", "directive_id:", "work_item:",
+                      "action:", "target_endpoint:"):
+            self.assertIn(field, posted, field)
+        # The id PM has to quote back appears verbatim, not as a placeholder.
+        self.assertIn(out.data["request_id"], posted)
+
+    def test_LOOP_005_the_request_names_only_endpoints_orbit_would_accept(self):
+        loop = self.loop()
+        loop.wake_pm(reason="bridge-online", nonce="n1")
+        posted = self.driver.composer_text
+        for endpoint_id in loop.adapter.registry.enabled_ids():
+            self.assertIn(endpoint_id, posted)
+
+    def test_LOOP_006_offering_a_target_does_not_authorise_it(self):
+        """The list is advisory; resolution is still the only authority."""
+        loop = self.loop()
+        registry = loop.adapter.registry
+        self.assertNotIn("some-chat-from-prose", registry.enabled_ids())
+        out = loop.dispatch(
+            directive=PMDirective(directive_id="d", request_id="r", work_item=WORK_ITEM,
+                                  action="DISPATCH_TO_ROLE",
+                                  target_endpoint="some-chat-from-prose"),
+            assignment="x TOKEN", verify_token="TOKEN")
+        self.assertEqual(out.action, "DISPATCH_FAILED")
+        self.assertIn("endpoint-not-registered", out.reason_code)
+
     def test_LOOP_003_stop_prevents_waking_pm(self):
         self.stop.write_text("stopped", encoding="utf-8")
         out = self.loop().wake_pm(reason="bridge-online", nonce="n1")

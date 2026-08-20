@@ -113,6 +113,15 @@ class ChatEndpointRegistry:
     def ids(self) -> List[str]:
         return sorted(self._by_id)
 
+    def enabled_ids(self) -> List[str]:
+        """The endpoints a directive may actually name.
+
+        Offered to PM so a decision can be expressed without out-of-band
+        knowledge of the slugs. Advisory only -- `resolve` re-checks everything,
+        so a directive naming something off this list still fails closed.
+        """
+        return sorted(e.endpoint_id for e in self._by_id.values() if e.enabled)
+
     def get(self, endpoint_id: str) -> Optional[ChatEndpoint]:
         return self._by_id.get(endpoint_id)
 
