@@ -843,11 +843,23 @@ switch ($Operation) {
     } catch { }
 
     # Whether the flag took effect is a separate question from whether it was
-    # passed, so it is measured rather than inferred. Two distinct measurements:
-    # a Document proves the renderer exposes web content at all, and a composer
-    # proves the current view is a chat. Without the second one the first is what
-    # separates "accessibility is dead" from "this is a settings or sign-in page".
-    $ready = $false; $descendants = 0; $webContent = $false
+    # passed, so it is measured rather than inferred -- and measured as three
+    # independent positive observations rather than one, because each answers a
+    # different question and absence of any single control proves very little:
+    #
+    #   renderer_semantics  is a real semantic subtree exposed at all?
+    #   chat_surface        is the app's conversation shell up?
+    #   accessibility_ready is *this* view a usable chat?
+    #
+    # A single Document node was the previous discriminator and was too weak in
+    # both directions: non-chat Chromium surfaces expose one, and a chat still
+    # rebuilding its subtree may briefly not.
+    $ready = $false; $descendants = 0
+    $hasDoc = $false; $chatSurface = $false
+    $types = @{}
+    $listName = ""
+    if ($P.chat_list_name) { $listName = [string]$P.chat_list_name }
+
     if ($windowed -and $trusted) {
       try {
         $el = $UIA::FromHandle($proc.MainWindowHandle)
@@ -856,13 +868,28 @@ switch ($Operation) {
           $descendants = $all.Count
           foreach ($e in $all) {
             $t = CT $e
-            if ($t -eq "Document") { $webContent = $true }
+            if ($t) { $types[$t] = $true }
+            if ($t -eq "Document") { $hasDoc = $true }
             if ($t -eq "Edit" -and (ClassOf $e) -like "*ProseMirror*") { $ready = $true }
-            if ($ready -and $webContent) { break }
+            if ($t -eq "List") {
+              # The conversation list is the shell landmark: it stays present
+              # while an individual conversation is blocked behind a prompt or a
+              # preview, which is exactly the case that must not be mistaken for
+              # a dead renderer.
+              if ($listName -and (NM $e) -cne $listName) { continue }
+              foreach ($child in $e.FindAll($Scope::Children, $Cond::TrueCondition)) {
+                if ((CT $child) -eq "ListItem") { $chatSurface = $true; break }
+              }
+            }
           }
         }
       } catch { }
     }
+
+    # Non-degenerate means several distinct control types over a real number of
+    # nodes. A window whose renderer exposes nothing still reports its frame, so
+    # "more than nothing" is the wrong bar.
+    $semantics = ($hasDoc -and $descendants -ge 25 -and $types.Count -ge 3)
 
     Done @{
       running = $true
@@ -872,10 +899,13 @@ switch ($Operation) {
       trusted_path = $trusted
       accessibility_flag = $flagged
       accessibility_ready = $ready
-      web_content_present = $webContent
+      renderer_semantics_present = $semantics
+      chat_surface_present = $chatSurface
       session_locked = $locked
       descendants = $descendants
+      control_type_count = $types.Count
       executable = $path
+      path_observed = ($path -ne "")
       process_count = $procs.Count
       reason = "observed"
     }

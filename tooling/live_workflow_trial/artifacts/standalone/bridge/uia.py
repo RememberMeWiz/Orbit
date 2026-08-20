@@ -163,8 +163,8 @@ class UiaDriver:
     def clear_attachments(self) -> UiaResult:
         return self.call("clear_attachments")
 
-    def app_state(self) -> UiaResult:
-        return self.call("app_state")
+    def app_state(self, chat_list_name: str = "") -> UiaResult:
+        return self.call("app_state", {"chat_list_name": chat_list_name})
 
     def launch_app(self, timeout_seconds: float = 60.0) -> UiaResult:
         return self.call("launch_app", {"timeout_seconds": timeout_seconds})

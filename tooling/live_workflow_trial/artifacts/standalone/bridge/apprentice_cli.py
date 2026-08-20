@@ -69,7 +69,9 @@ def preflight(loop: ApprenticeLoop, args) -> Dict[str, Any]:
     Returned as a payload rather than raised, so a blocked surface is reported
     with its remedy instead of surfacing as a driver error further in.
     """
-    outcome = AccessibilityGuard(loop.adapter.driver).ensure(allow_launch=not args.no_launch)
+    outcome = AccessibilityGuard(loop.adapter.driver,
+                                 chat_list_name=loop.adapter.chat_list_name
+                                 ).ensure(allow_launch=not args.no_launch)
     # `drivable`, not `ok`: every verb focuses the endpoint it needs, so a
     # conversation stuck behind a prompt must not block reaching a different one.
     if outcome.drivable:
@@ -85,7 +87,8 @@ def emit(payload: Dict[str, Any]) -> int:
 def cmd_status(loop: ApprenticeLoop, args) -> int:
     pm = loop.pm_state.load()
     pending = pm.get("pending_request")
-    guard = AccessibilityGuard(loop.adapter.driver).observe()
+    guard = AccessibilityGuard(loop.adapter.driver,
+                               chat_list_name=loop.adapter.chat_list_name).observe()
     ready = loop.adapter.surface_ready()
     return emit({
         "ok": True,

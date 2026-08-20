@@ -81,6 +81,7 @@ TRANSIENT_REASONS = frozenset({
     "accessibility-not-exposed",
     "window-not-ready",
     "composer-not-present",
+    "non-chat-surface",
 })
 
 # Waiting for a just-launched app to appear is also transient, but only *after*
@@ -91,6 +92,8 @@ _SETTLE_REASONS = TRANSIENT_REASONS | {"app-not-running"}
 # unambiguous instance, session unlocked -- and only the conversation on screen
 # is unusable. Switching conversations resolves these, so they must not gate a
 # preflight; see GuardOutcome.drivable.
+# `non-chat-surface` is deliberately absent: with no conversation shell there is
+# no list to select an endpoint from, so nothing downstream could succeed.
 DRIVABLE_REASONS = frozenset({"composer-not-present"})
 
 
@@ -99,11 +102,13 @@ class AccessibilityGuard:
         self,
         driver: Optional[UiaDriver] = None,
         *,
+        chat_list_name: str = "",
         sleeper: Callable[[float], None] = time.sleep,
         settle_seconds: float = 2.0,
         launch_timeout: float = 60.0,
     ):
         self.driver = driver or UiaDriver()
+        self.chat_list_name = chat_list_name
         self._sleep = sleeper
         self.settle_seconds = settle_seconds
         self.launch_timeout = launch_timeout
@@ -118,7 +123,7 @@ class AccessibilityGuard:
         human to restart something a restart cannot repair is worse than saying
         nothing, because they will do it.
         """
-        result = self.driver.app_state()
+        result = self.driver.app_state(self.chat_list_name)
         if not result.ok:
             return GuardOutcome(UNAVAILABLE, str(result.get("reason_code", "app-state-failed")),
                                 detail=str(result.get("detail", "")))
@@ -128,34 +133,48 @@ class AccessibilityGuard:
             return GuardOutcome(UNAVAILABLE, "app-not-running", state=state,
                                 remedy="Orbit can start it.")
 
-        # Checked before anything derived from the UIA tree, because a locked
-        # workstation hides the tree entirely and every downstream conclusion
-        # would be drawn from an observation that could not have succeeded.
-        if state.get("session_locked"):
-            return GuardOutcome(UNAVAILABLE, "interactive-session-unavailable", state=state,
-                                remedy="Unlock the Windows session. Restarting the app will not help.")
-
+        # Trust and instance count come from the process table, not the UIA
+        # tree, so both are established whether or not the desktop is readable --
+        # and they outrank the lock for that reason. Reporting only "locked"
+        # would hide the stronger fact that Orbit had selected a process outside
+        # the trusted package.
+        if not state.get("path_observed", bool(state.get("executable"))):
+            return GuardOutcome(UNAVAILABLE, "app-path-unreadable", state=state,
+                                remedy="Check permissions on the ChatGPT process, then retry.")
         if not state.get("trusted_path"):
-            # A process named ChatGPT from somewhere else is not our app, and is
-            # certainly not something to launch a second copy alongside.
-            return GuardOutcome(NEEDS_HUMAN_RESTART, "app-untrusted-path",
+            # A trust mismatch is not evidence that restarting is the repair.
+            # The right move might be finishing an update, closing an old
+            # install, or investigating a foreign process -- the guard cannot
+            # tell which, so it reports rather than prescribes.
+            return GuardOutcome(UNAVAILABLE, "app-untrusted-path",
                                 detail=str(state.get("executable", "")), state=state,
-                                remedy="Verify which ChatGPT process is running before continuing.")
+                                remedy="Verify which ChatGPT instance and install is running "
+                                       "before continuing.")
 
         # More than one instance owns a window, so "the app" has no single state
-        # to report. Refusing here matches how endpoints resolve: ambiguity is an
-        # error, never a best guess -- and a guess would let one instance's
-        # readiness authorise driving a different one.
+        # to report. Selection is "first windowed process", which is not a stable
+        # identity contract across observations -- and READY is only meaningful
+        # if downstream work binds to the same target. Refused the same way
+        # ambiguous endpoints are: ambiguity is an error, never a best guess.
         if state.get("instance_ambiguous"):
             return GuardOutcome(
                 UNAVAILABLE, "multiple-instance-ambiguous",
                 detail=f"{state.get('windowed_count')} windowed instances", state=state,
                 remedy="Close the extra ChatGPT windows so one instance is unambiguous.")
 
+        # Only now the tree-derived states, since a locked workstation hides the
+        # tree entirely and every conclusion below would otherwise be drawn from
+        # an observation that could not have succeeded.
+        if state.get("session_locked"):
+            return GuardOutcome(UNAVAILABLE, "interactive-session-unavailable", state=state,
+                                remedy="Unlock the Windows session. Restarting the app will not help.")
+
         if not state.get("windowed"):
-            # A process with no window *and* no flag is already decided: the flag
-            # cannot be acquired in place, so reporting the missing window would
-            # point at the wrong remedy even though a window may appear later.
+            # Narrow rule, not a general principle: prefer an observed cause over
+            # a transient symptom only when that cause alone determines the
+            # remedy and cannot resolve by waiting. A missing launch flag
+            # qualifies -- it cannot be acquired in place, so a window appearing
+            # later would change nothing.
             if not state.get("accessibility_flag"):
                 return GuardOutcome(NEEDS_HUMAN_RESTART, "accessibility-flag-absent", state=state,
                                     remedy=RESTART_INSTRUCTION)
@@ -165,26 +184,36 @@ class AccessibilityGuard:
         if state.get("accessibility_ready"):
             return GuardOutcome(READY, "ok", state=state)
 
+        # The one state where a relaunch really is the uniquely established
+        # remedy, because the flag cannot be acquired in place.
         if not state.get("accessibility_flag"):
             return GuardOutcome(NEEDS_HUMAN_RESTART, "accessibility-flag-absent", state=state,
                                 remedy=RESTART_INSTRUCTION)
 
-        # Flag present and the renderer is exposing web content, so accessibility
-        # is working -- the visible view simply is not a chat. Sign-in, settings,
-        # a modal, an update screen. Restarting would not produce a composer, and
-        # would cost the human whatever is on screen.
-        if state.get("web_content_present"):
+        if state.get("renderer_semantics_present"):
+            # Shell up, no composer: some conversation is behind a prompt, a file
+            # preview or a modal. Switching conversations resolves it.
+            if state.get("chat_surface_present"):
+                return GuardOutcome(
+                    UNAVAILABLE, "composer-not-present", state=state,
+                    remedy="Open a conversation in ChatGPT, or dismiss whatever is covering "
+                           "the composer — a file preview, a modal, or an in-conversation "
+                           "confirmation prompt. No restart needed.")
+            # Semantics but no conversation shell at all: sign-in, first run,
+            # a full-screen settings or update surface.
             return GuardOutcome(
-                UNAVAILABLE, "composer-not-present", state=state,
-                remedy="Open a conversation in ChatGPT, or dismiss whatever is covering "
-                       "the composer — a file preview, a modal, or an in-conversation "
-                       "confirmation prompt. No restart needed.")
+                UNAVAILABLE, "non-chat-surface", state=state,
+                remedy="Sign in, or navigate back to the conversation list in the "
+                       "running app. No restart needed.")
 
-        # Flag present, no web content at all: the renderer really is opaque.
-        # Still may be a window mid-construction, so `ensure` re-observes before
-        # settling on it.
-        return GuardOutcome(NEEDS_HUMAN_RESTART, "accessibility-not-exposed", state=state,
-                            remedy=RESTART_INSTRUCTION)
+        # Flag present, window present, and after settling still no meaningful
+        # semantic subtree. A relaunch may well fix it, but that is the human's
+        # call: absence of controls is not positive evidence of a launch defect.
+        return GuardOutcome(
+            UNAVAILABLE, "accessibility-not-exposed", state=state,
+            remedy="Restore a normal interactive ChatGPT surface. Relaunching with "
+                   "--force-renderer-accessibility may help, but is not established "
+                   "as the cause.")
 
     # -- action ----------------------------------------------------------
 

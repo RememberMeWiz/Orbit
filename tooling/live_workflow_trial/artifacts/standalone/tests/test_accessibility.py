@@ -30,13 +30,15 @@ def deny(reason: str, detail: str = "") -> UiaResult:
 RUNNING_READY = {
     "running": True, "windowed": True, "windowed_count": 1, "instance_ambiguous": False,
     "trusted_path": True, "accessibility_flag": True, "accessibility_ready": True,
-    "web_content_present": True, "session_locked": False,
+    "renderer_semantics_present": True, "chat_surface_present": True,
+    "session_locked": False, "path_observed": True,
     "executable": r"C:\...\OpenAI.Codex_x\app\ChatGPT.exe", "descendants": 900,
 }
 NOT_RUNNING = {
     "running": False, "windowed": False, "windowed_count": 0, "instance_ambiguous": False,
     "trusted_path": False, "accessibility_flag": False, "accessibility_ready": False,
-    "web_content_present": False, "session_locked": False, "executable": "",
+    "renderer_semantics_present": False, "chat_surface_present": False,
+    "session_locked": False, "path_observed": False, "executable": "",
 }
 
 
@@ -54,7 +56,7 @@ class FakeDriver:
         self.launch_result = launch if launch is not None else ok({"launched": True})
         self.calls: List[str] = []
 
-    def app_state(self) -> UiaResult:
+    def app_state(self, chat_list_name: str = "") -> UiaResult:
         self.calls.append("app_state")
         state = self.states.pop(0) if len(self.states) > 1 else self.states[0]
         return state if isinstance(state, UiaResult) else ok(state)
@@ -104,9 +106,29 @@ class ObserveTests(unittest.TestCase):
         self.assertIn("--force-renderer-accessibility", out.remedy)
 
     def test_ACC_013_untrusted_process_is_never_treated_as_our_app(self):
-        out = guard(FakeDriver([variant(trusted_path=False, executable=r"C:\tmp\ChatGPT.exe")])).observe()
-        self.assertEqual(out.status, NEEDS_HUMAN_RESTART)
+        """A trust mismatch is reported, not prescribed a restart it may not need."""
+        out = guard(FakeDriver([variant(trusted_path=False,
+                                        executable=r"C:\tmp\ChatGPT.exe")])).observe()
+        self.assertEqual(out.status, UNAVAILABLE)
         self.assertEqual(out.reason_code, "app-untrusted-path")
+        self.assertNotIn("--force-renderer-accessibility", out.remedy)
+
+    def test_ACC_013b_trust_outranks_a_locked_session(self):
+        """The path came from the process table, so the lock does not hide it."""
+        out = guard(FakeDriver([variant(trusted_path=False, session_locked=True,
+                                        executable=r"C:\tmp\ChatGPT.exe")])).observe()
+        self.assertEqual(out.reason_code, "app-untrusted-path")
+
+    def test_ACC_013c_ambiguity_also_outranks_a_locked_session(self):
+        out = guard(FakeDriver([variant(instance_ambiguous=True, windowed_count=2,
+                                        session_locked=True)])).observe()
+        self.assertEqual(out.reason_code, "multiple-instance-ambiguous")
+
+    def test_ACC_013d_an_unreadable_path_is_not_reported_as_untrusted(self):
+        """Access denied is a different problem from a foreign executable."""
+        out = guard(FakeDriver([variant(path_observed=False, executable="",
+                                        trusted_path=False)])).observe()
+        self.assertEqual(out.reason_code, "app-path-unreadable")
 
     def test_ACC_014_windowless_flagged_process_is_waited_for_not_restarted(self):
         """The immutable requirement is already met; a window may appear."""
@@ -119,7 +141,7 @@ class ObserveTests(unittest.TestCase):
     def test_ACC_017_a_locked_session_is_not_a_restart_problem(self):
         """Restarting the app cannot unlock Windows, so it must not be advised."""
         out = guard(FakeDriver([variant(session_locked=True, accessibility_ready=False,
-                                        web_content_present=False)])).observe()
+                                        renderer_semantics_present=False, chat_surface_present=False)])).observe()
         self.assertEqual(out.status, UNAVAILABLE)
         self.assertEqual(out.reason_code, "interactive-session-unavailable")
         self.assertIn("Unlock", out.remedy)
@@ -128,23 +150,40 @@ class ObserveTests(unittest.TestCase):
     def test_ACC_018_a_locked_session_outranks_the_hidden_tree_it_causes(self):
         """The tree is unreadable *because* of the lock; report the cause."""
         out = guard(FakeDriver([variant(session_locked=True, accessibility_ready=False,
-                                        web_content_present=False, descendants=0)])).observe()
+                                        renderer_semantics_present=False, chat_surface_present=False, descendants=0)])).observe()
         self.assertEqual(out.reason_code, "interactive-session-unavailable")
 
     def test_ACC_019_a_non_chat_view_is_not_an_accessibility_failure(self):
         """Sign-in, settings or a modal: the renderer is fine, the view is not a chat."""
         out = guard(FakeDriver([variant(accessibility_ready=False,
-                                        web_content_present=True)])).observe()
+                                        renderer_semantics_present=True, chat_surface_present=True)])).observe()
         self.assertEqual(out.status, UNAVAILABLE)
         self.assertEqual(out.reason_code, "composer-not-present")
         self.assertNotIn("Close ChatGPT", out.remedy)
 
-    def test_ACC_01A_an_opaque_renderer_still_needs_a_restart(self):
-        """No composer *and* no web content at all: accessibility really is dead."""
+    def test_ACC_01A_an_opaque_renderer_is_reported_without_prescribing_a_restart(self):
+        """Absence of controls is not positive evidence of a launch defect."""
         out = guard(FakeDriver([variant(accessibility_ready=False,
-                                        web_content_present=False)])).observe()
-        self.assertEqual(out.status, NEEDS_HUMAN_RESTART)
+                                        renderer_semantics_present=False,
+                                        chat_surface_present=False)])).observe()
+        self.assertEqual(out.status, UNAVAILABLE)
         self.assertEqual(out.reason_code, "accessibility-not-exposed")
+        self.assertIn("not established", out.remedy)
+
+    def test_ACC_01A2_a_missing_flag_is_the_one_established_restart(self):
+        """The flag cannot be acquired in place, so relaunching really is the fix."""
+        out = guard(FakeDriver([variant(accessibility_flag=False,
+                                        accessibility_ready=False)])).observe()
+        self.assertEqual(out.status, NEEDS_HUMAN_RESTART)
+
+    def test_ACC_01A3_semantics_without_a_chat_shell_is_its_own_state(self):
+        """Sign-in or a full-screen settings surface: navigate, do not restart."""
+        out = guard(FakeDriver([variant(accessibility_ready=False,
+                                        renderer_semantics_present=True,
+                                        chat_surface_present=False)])).observe()
+        self.assertEqual(out.status, UNAVAILABLE)
+        self.assertEqual(out.reason_code, "non-chat-surface")
+        self.assertFalse(out.drivable)   # no list to select an endpoint from
 
     def test_ACC_01B_no_window_and_no_flag_reports_the_decisive_cause(self):
         """The flag cannot be acquired in place, so the window is not the problem."""
@@ -175,7 +214,7 @@ class ObserveTests(unittest.TestCase):
 
     def test_ACC_015_driver_failure_is_unavailable(self):
         driver = FakeDriver([])
-        driver.app_state = lambda: deny("driver-timeout")  # type: ignore[assignment]
+        driver.app_state = lambda chat_list_name="": deny("driver-timeout")  # type: ignore[assignment]
         out = AccessibilityGuard(driver, sleeper=lambda _s: None).observe()
         self.assertEqual(out.status, UNAVAILABLE)
         self.assertEqual(out.reason_code, "driver-timeout")
@@ -234,7 +273,7 @@ class EnsureTests(unittest.TestCase):
     def test_ACC_027_launch_that_never_becomes_usable_needs_a_human(self):
         driver = FakeDriver([NOT_RUNNING, variant(accessibility_flag=True,
                                                   accessibility_ready=False,
-                                                  web_content_present=False)])
+                                                  renderer_semantics_present=False, chat_surface_present=False)])
         out = guard(driver).ensure()
         self.assertEqual(out.status, NEEDS_HUMAN_RESTART)
         self.assertFalse(out.ok)
@@ -253,14 +292,14 @@ class EnsureTests(unittest.TestCase):
         self.assertNotIn("launch_app", driver.calls)
 
     def test_ACC_02C_a_view_that_becomes_a_chat_resolves_without_a_restart(self):
-        driver = FakeDriver([variant(accessibility_ready=False, web_content_present=True),
+        driver = FakeDriver([variant(accessibility_ready=False, renderer_semantics_present=True, chat_surface_present=True),
                              RUNNING_READY])
         out = guard(driver).ensure()
         self.assertEqual(out.status, READY)
         self.assertNotIn("launch_app", driver.calls)
 
     def test_ACC_02D_a_view_that_stays_non_chat_is_reported_as_such(self):
-        driver = FakeDriver([variant(accessibility_ready=False, web_content_present=True)])
+        driver = FakeDriver([variant(accessibility_ready=False, renderer_semantics_present=True, chat_surface_present=True)])
         out = guard(driver).ensure()
         self.assertEqual(out.reason_code, "composer-not-present")
         self.assertFalse(out.ok)
@@ -284,7 +323,7 @@ class DrivableTests(unittest.TestCase):
     def test_ACC_040_a_non_chat_view_still_leaves_the_app_drivable(self):
         """Otherwise one stuck conversation hides every healthy one."""
         out = guard(FakeDriver([variant(accessibility_ready=False,
-                                        web_content_present=True)])).observe()
+                                        renderer_semantics_present=True, chat_surface_present=True)])).observe()
         self.assertFalse(out.ok)
         self.assertTrue(out.drivable)
 
@@ -295,7 +334,7 @@ class DrivableTests(unittest.TestCase):
 
     def test_ACC_042_genuinely_broken_states_are_not_drivable(self):
         for state in (variant(accessibility_flag=False, accessibility_ready=False,
-                              web_content_present=False),
+                              renderer_semantics_present=False, chat_surface_present=False),
                       variant(session_locked=True),
                       variant(trusted_path=False),
                       variant(windowed_count=2, instance_ambiguous=True),
@@ -305,7 +344,7 @@ class DrivableTests(unittest.TestCase):
 
     def test_ACC_043_drivability_is_reported_alongside_readiness(self):
         payload = guard(FakeDriver([variant(accessibility_ready=False,
-                                            web_content_present=True)])).observe().to_dict()
+                                            renderer_semantics_present=True, chat_surface_present=True)])).observe().to_dict()
         self.assertFalse(payload["ok"])
         self.assertTrue(payload["drivable"])
 

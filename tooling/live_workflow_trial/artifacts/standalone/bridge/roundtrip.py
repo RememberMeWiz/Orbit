@@ -67,7 +67,8 @@ class RoundTrip:
     ):
         self.loop = loop
         self.journal_path = journal_path
-        self.guard = guard if guard is not None else AccessibilityGuard(loop.adapter.driver)
+        self.guard = guard if guard is not None else AccessibilityGuard(
+            loop.adapter.driver, chat_list_name=loop.adapter.chat_list_name)
         self.allow_launch = allow_launch
         self.observer = observer
 
