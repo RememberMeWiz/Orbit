@@ -13,6 +13,7 @@ ever selected from message text, and no operation accepts a coordinate.
 """
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
@@ -26,6 +27,7 @@ from workflow.core.validation import NAME_RE, parse_header
 
 from .contracts import ChatEndpoint, ChatTransportResult
 from .delivery import DeliveryError, DeliveryLedger, digest_text
+from .pm_envelope import assistant_turns
 from .registry import ChatEndpointRegistry
 from .uia import UiaDriver
 
@@ -40,6 +42,13 @@ POLL_INTERVAL = 3.0
 IDLE_CONFIRM_SECONDS = 6.0
 # How long to wait for a pasted message to appear in the accessibility tree.
 STAGE_VERIFY_SECONDS = 8.0
+
+# Delimiters for a handoff returned in the conversation itself rather than as a
+# downloadable file. Plain lines on purpose: the accessibility tree fragments a
+# syntax-highlighted code block into one node per token, so anything relying on
+# fences or inline code would arrive shredded.
+_HANDOFF_BEGIN_RE = re.compile(r"(?m)^[ \t]*ORBIT_HANDOFF_BEGIN[ \t]+(?P<name>\S+)[ \t]*$")
+_HANDOFF_END_RE = re.compile(r"(?m)^[ \t]*ORBIT_HANDOFF_END[ \t]*$")
 
 
 @dataclass
@@ -508,6 +517,81 @@ class ChatGptAdapter:
             "sequence": fields.get("sequence"),
         })
 
+    def collect_from_transcript(
+        self,
+        *,
+        endpoint_id: str,
+        expected_name: str,
+        inbox_dir: "Path",
+        work_item: str,
+        expected_sender: str = "",
+        max_chars: int = 20000,
+    ) -> ChatTransportResult:
+        """Materialise a handoff the worker wrote into the conversation.
+
+        The file path exists so that asking a worker for a *downloadable file*
+        is not the only way to get a handoff back. That request is what makes
+        the app offer to escalate into a paid work mode, so for a text handoff
+        it costs credits to obtain something the conversation could simply have
+        contained.
+
+        Provenance is scoped exactly as directives are: only assistant turns are
+        searched. Orbit's own assignment names the expected filename, so without
+        that scoping Orbit would find its own instructions and try to collect
+        them.
+
+        Validation is not relaxed. The bytes are written to the same inbox and
+        run through the same checks as a saved file, because an easier path that
+        is also a weaker path is how things get smuggled in.
+        """
+        focused = self.focus(endpoint_id)
+        if not focused.ok:
+            return ChatTransportResult.deny(
+                "COLLECT_EXPECTED_ARTIFACT", focused.reason_code, focused.detail)
+
+        match = NAME_RE.match(expected_name)
+        if not match:
+            return ChatTransportResult.deny(
+                "COLLECT_EXPECTED_ARTIFACT", "artifact-name-not-handoff-shaped", expected_name)
+        if match.groupdict()["work"] != work_item:
+            return ChatTransportResult.deny(
+                "COLLECT_EXPECTED_ARTIFACT", "artifact-work-item-mismatch",
+                f"filename declares {match.groupdict()['work']}, expected {work_item}")
+        if match.groupdict()["ext"].lower() != "md":
+            return ChatTransportResult.deny(
+                "COLLECT_EXPECTED_ARTIFACT", "artifact-transcript-requires-markdown", expected_name)
+
+        tail = self.driver.read_transcript_tail(max_chars)
+        if not tail.ok:
+            return ChatTransportResult.deny("COLLECT_EXPECTED_ARTIFACT", tail.reason_code)
+
+        bodies = [b for turn in assistant_turns(str(tail.data.get("text", "")))
+                  for b in _handoff_blocks(turn, expected_name)]
+        if not bodies:
+            return ChatTransportResult.deny(
+                "COLLECT_EXPECTED_ARTIFACT", "transcript-handoff-not-found", expected_name)
+
+        inbox = Path(inbox_dir)
+        inbox.mkdir(parents=True, exist_ok=True)
+        destination = inbox / expected_name
+        if destination.exists():
+            return ChatTransportResult.deny(
+                "COLLECT_EXPECTED_ARTIFACT", "artifact-already-collected", str(destination))
+
+        # Newest wins, matching how a directive is read: the latest thing the
+        # worker wrote is the one that counts if it revised its answer.
+        destination.write_text(bodies[-1], encoding="utf-8")
+        result = self._validate_collected(destination, expected_name, work_item, expected_sender)
+        if not result.ok:
+            # Do not leave an invalid file sitting in the inbox looking collected.
+            try:
+                destination.unlink()
+            except OSError:
+                pass
+            return result
+        result.data["source"] = "transcript"
+        return result
+
     def attach_artifact(
         self,
         *,
@@ -673,3 +757,24 @@ class ChatGptAdapter:
             "message_digest": message_digest,
             "attempt": record.get("attempt"),
         }, delivery_state="SENT_UNCONFIRMED")
+
+
+def _handoff_blocks(text: str, expected_name: str) -> List[str]:
+    """Every complete, correctly-named handoff block in one turn, oldest first.
+
+    An unterminated block is skipped rather than read to the end of the turn: a
+    worker whose message was cut off has not delivered a handoff, and treating
+    the remaining transcript as its body would invent one.
+    """
+    blocks: List[str] = []
+    for begin in _HANDOFF_BEGIN_RE.finditer(text):
+        if begin.group("name") != expected_name:
+            continue
+        rest = text[begin.end():]
+        end = _HANDOFF_END_RE.search(rest)
+        if not end:
+            continue
+        body = rest[:end.start()].strip("\r\n")
+        if body.strip():
+            blocks.append(body + "\n")
+    return blocks

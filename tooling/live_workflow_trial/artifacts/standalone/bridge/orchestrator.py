@@ -233,10 +233,19 @@ class ApprenticeLoop:
                            {"elapsed": obs.elapsed, "polls": obs.polls})
 
     def collect(self, *, endpoint_id: str, expected_name: str,
-                expected_sender: str = "") -> LoopOutcome:
+                expected_sender: str = "", source: str = "file") -> LoopOutcome:
+        """Materialise the expected handoff, from a file card or the transcript.
+
+        `source="transcript"` is the cheaper route: asking a worker for a
+        downloadable file is what prompts the app to offer a paid work mode, so
+        a plain text handoff costs credits to obtain something the conversation
+        already contained. Both routes end in the same validator.
+        """
         if self.inbox_dir is None:
             return LoopOutcome("COLLECT_FAILED", "no-bridge-inbox-configured")
-        result = self.adapter.collect_artifact(
+        collector = (self.adapter.collect_from_transcript if source == "transcript"
+                     else self.adapter.collect_artifact)
+        result = collector(
             endpoint_id=endpoint_id, expected_name=expected_name,
             inbox_dir=self.inbox_dir, work_item=self.work_item,
             expected_sender=expected_sender)

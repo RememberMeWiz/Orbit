@@ -10,7 +10,8 @@ ordinary restart rather than a special case.
     poll       look for a PM directive answering the pending request
     dispatch   carry out the accepted directive
     await      wait for the target conversation to finish responding
-    collect    materialise and validate the expected artifact
+    collect    materialise and validate the expected handoff
+               (--source transcript avoids the paid work-mode prompt)
     cycle      all of the above as one governed round trip
     clear      remove staged attachments after an abandoned dispatch
 
@@ -181,7 +182,7 @@ def cmd_collect(loop: ApprenticeLoop, args) -> int:
         return emit(blocked)
 
     out = loop.collect(endpoint_id=args.endpoint, expected_name=args.expect,
-                       expected_sender=args.sender)
+                       expected_sender=args.sender, source=args.source)
     return emit({"ok": out.action == "COLLECTED", **out.to_dict()})
 
 
@@ -255,6 +256,8 @@ def main(argv=None) -> int:
     collect.add_argument("--endpoint", required=True)
     collect.add_argument("--expect", required=True)
     collect.add_argument("--sender", default="")
+    collect.add_argument("--source", choices=("file", "transcript"), default="file",
+                         help="transcript avoids the app's paid work-mode prompt entirely")
     collect.set_defaults(func=cmd_collect)
 
     cycle = sub.add_parser("cycle", help="run one full PM -> worker -> PM round trip")
