@@ -23,6 +23,7 @@ import json
 from pathlib import Path
 from typing import Any, Dict
 
+from .accessibility import AccessibilityGuard
 from .chatgpt import ChatGptAdapter
 from .delivery import DeliveryLedger
 from .orchestrator import ApprenticeLoop
@@ -60,6 +61,18 @@ def build_loop(state_dir: Path, work_item: str, *, timeout: float = 300.0) -> Ap
     )
 
 
+def preflight(loop: ApprenticeLoop, args) -> Dict[str, Any]:
+    """Confirm the app surface is usable before any verb that touches it.
+
+    Returned as a payload rather than raised, so a blocked surface is reported
+    with its remedy instead of surfacing as a driver error further in.
+    """
+    outcome = AccessibilityGuard(loop.adapter.driver).ensure(allow_launch=not args.no_launch)
+    if outcome.ok:
+        return {}
+    return {"ok": False, "action": "SURFACE_UNAVAILABLE", **outcome.to_dict()}
+
+
 def emit(payload: Dict[str, Any]) -> int:
     print(json.dumps(payload, indent=2, sort_keys=True, default=str))
     return 0 if payload.get("ok", True) else 1
@@ -68,6 +81,7 @@ def emit(payload: Dict[str, Any]) -> int:
 def cmd_status(loop: ApprenticeLoop, args) -> int:
     pm = loop.pm_state.load()
     pending = pm.get("pending_request")
+    guard = AccessibilityGuard(loop.adapter.driver).observe()
     ready = loop.adapter.surface_ready()
     return emit({
         "ok": True,
@@ -75,6 +89,7 @@ def cmd_status(loop: ApprenticeLoop, args) -> int:
         "stopped": loop.stopped(),
         "surface_ready": ready.ok,
         "surface_reason": ready.reason_code,
+        "accessibility": guard.to_dict(),
         "observed_chats": ready.data.get("chat_items", []),
         "pending_request": pending,
         "consumed_directives": pm.get("consumed_directive_ids", []),
@@ -84,17 +99,29 @@ def cmd_status(loop: ApprenticeLoop, args) -> int:
 
 
 def cmd_wake(loop: ApprenticeLoop, args) -> int:
+    blocked = preflight(loop, args)
+    if blocked:
+        return emit(blocked)
+
     out = loop.wake_pm(reason=args.reason, nonce=args.nonce,
                        artifact_id=args.artifact_id, artifact_digest=args.artifact_sha256)
     return emit({"ok": out.action == "PM_WOKEN", **out.to_dict()})
 
 
 def cmd_poll(loop: ApprenticeLoop, args) -> int:
+    blocked = preflight(loop, args)
+    if blocked:
+        return emit(blocked)
+
     out = loop.await_directive(timeout=args.timeout)
     return emit({"ok": out.action == "DIRECTIVE_ACCEPTED", **out.to_dict()})
 
 
 def cmd_dispatch(loop: ApprenticeLoop, args) -> int:
+    blocked = preflight(loop, args)
+    if blocked:
+        return emit(blocked)
+
     pm = loop.pm_state.load()
     if not pm.get("pending_request"):
         return emit({"ok": False, "action": "NO_PENDING_REQUEST"})
@@ -130,6 +157,10 @@ def cmd_dispatch(loop: ApprenticeLoop, args) -> int:
 
 
 def cmd_await(loop: ApprenticeLoop, args) -> int:
+    blocked = preflight(loop, args)
+    if blocked:
+        return emit(blocked)
+
     focused = loop.adapter.focus(args.endpoint)
     if not focused.ok:
         return emit({"ok": False, "action": "FOCUS_FAILED", "reason_code": focused.reason_code})
@@ -138,12 +169,20 @@ def cmd_await(loop: ApprenticeLoop, args) -> int:
 
 
 def cmd_collect(loop: ApprenticeLoop, args) -> int:
+    blocked = preflight(loop, args)
+    if blocked:
+        return emit(blocked)
+
     out = loop.collect(endpoint_id=args.endpoint, expected_name=args.expect,
                        expected_sender=args.sender)
     return emit({"ok": out.action == "COLLECTED", **out.to_dict()})
 
 
 def cmd_clear(loop: ApprenticeLoop, args) -> int:
+    blocked = preflight(loop, args)
+    if blocked:
+        return emit(blocked)
+
     result = loop.adapter.clear_attachments()
     return emit({"ok": result.ok, "reason_code": result.reason_code, "data": result.data})
 
@@ -153,6 +192,8 @@ def main(argv=None) -> int:
     parser.add_argument("--state-dir", type=Path, required=True)
     parser.add_argument("--work-item", required=True)
     parser.add_argument("--driver-timeout", type=float, default=300.0)
+    parser.add_argument("--no-launch", action="store_true",
+                        help="never start ChatGPT Desktop; report a dead surface instead")
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("status").set_defaults(func=cmd_status)

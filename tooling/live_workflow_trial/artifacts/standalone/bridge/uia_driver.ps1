@@ -711,5 +711,98 @@ switch ($Operation) {
     Done @{ name = $wanted; matches = $hits; count = $hits.Count }
   }
 
+  # Report whether the app is running, whether it was started with renderer
+  # accessibility, and whether the semantic tree is actually usable. Unlike
+  # every other operation this one must succeed when the app is absent -- "not
+  # running" is an answer, not a failure.
+  "app_state" {
+    $procs = @(Get-Process -Name ChatGPT -ErrorAction SilentlyContinue)
+    $windowed = @($procs | Where-Object { $_.MainWindowHandle -ne 0 })
+
+    if (-not $procs) {
+      Done @{
+        running = $false; windowed = $false; trusted_path = $false
+        accessibility_flag = $false; accessibility_ready = $false
+        executable = ""; reason = "not-running"
+      }
+    }
+
+    $proc = if ($windowed) { $windowed | Select-Object -First 1 } else { $procs | Select-Object -First 1 }
+    $path = ""
+    try { $path = [string]$proc.Path } catch { }
+    $trusted = ($path -like "*OpenAI.Codex*")
+
+    # The flag is only observable on the command line. A renderer that was
+    # started without it exposes no semantic tree no matter how long we wait.
+    $cmdline = ""
+    try { $cmdline = [string](Get-CimInstance Win32_Process -Filter "ProcessId=$($proc.Id)" -ErrorAction Stop).CommandLine } catch { }
+    $flagged = ($cmdline -like "*--force-renderer-accessibility*")
+
+    # Whether the flag took effect is a separate question from whether it was
+    # passed, so it is measured rather than inferred: a composer in the tree is
+    # the smallest proof that renderer accessibility is live.
+    $ready = $false; $descendants = 0
+    if ($windowed -and $trusted) {
+      try {
+        $el = $UIA::FromHandle($proc.MainWindowHandle)
+        if ($null -ne $el) {
+          $all = All-Descendants $el
+          $descendants = $all.Count
+          foreach ($e in $all) {
+            if ((CT $e) -eq "Edit" -and (ClassOf $e) -like "*ProseMirror*") { $ready = $true; break }
+          }
+        }
+      } catch { }
+    }
+
+    Done @{
+      running = $true
+      windowed = [bool]$windowed
+      trusted_path = $trusted
+      accessibility_flag = $flagged
+      accessibility_ready = $ready
+      descendants = $descendants
+      executable = $path
+      process_count = $procs.Count
+      reason = "observed"
+    }
+  }
+
+  # Start the app with renderer accessibility enabled.
+  #
+  # Refuses outright if any ChatGPT process already exists. Orbit does not get
+  # to end a session a human may be using, and an app already running without
+  # the flag can only be fixed by that human restarting it -- so this reports
+  # the problem instead of "fixing" it.
+  "launch_app" {
+    $existing = @(Get-Process -Name ChatGPT -ErrorAction SilentlyContinue)
+    if ($existing) { Fail "launch-refused-already-running" "$($existing.Count) process(es)" }
+
+    # Resolved from the installed package rather than a pinned path, so a normal
+    # app update does not silently disarm the guard.
+    $pkg = Get-AppxPackage -Name "OpenAI.Codex" -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $pkg) { Fail "launch-package-not-installed" }
+    $exe = Join-Path $pkg.InstallLocation "app\ChatGPT.exe"
+    if (-not (Test-Path -LiteralPath $exe)) { Fail "launch-executable-missing" $exe }
+    if ($exe -notlike "*OpenAI.Codex*") { Fail "launch-untrusted-path" $exe }
+
+    try { Start-Process -FilePath $exe -ArgumentList "--force-renderer-accessibility" | Out-Null }
+    catch { Fail "launch-failed" $_.Exception.Message }
+
+    # Report what actually came up. A launch that starts a process but never
+    # produces a usable window is a failure the caller needs to see.
+    $waitSeconds = 60.0
+    if ($P.timeout_seconds) { $waitSeconds = [double]$P.timeout_seconds }
+    $deadline = (Get-Date).AddSeconds($waitSeconds)
+    $seen = $false
+    while ((Get-Date) -lt $deadline) {
+      $p = @(Get-Process -Name ChatGPT -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 })
+      if ($p) { $seen = $true; break }
+      Start-Sleep -Milliseconds 500
+    }
+    if (-not $seen) { Fail "launch-no-window" $exe }
+    Done @{ launched = $true; executable = $exe; package_version = [string]$pkg.Version }
+  }
+
   default { Fail "operation-not-supported" $Operation }
 }

@@ -34,6 +34,8 @@ DRIVER_OPERATIONS = (
     "attachment_state",
     "describe_control",
     "clear_attachments",
+    "app_state",
+    "launch_app",
 )
 
 
@@ -156,3 +158,9 @@ class UiaDriver:
 
     def clear_attachments(self) -> UiaResult:
         return self.call("clear_attachments")
+
+    def app_state(self) -> UiaResult:
+        return self.call("app_state")
+
+    def launch_app(self, timeout_seconds: float = 60.0) -> UiaResult:
+        return self.call("launch_app", {"timeout_seconds": timeout_seconds})

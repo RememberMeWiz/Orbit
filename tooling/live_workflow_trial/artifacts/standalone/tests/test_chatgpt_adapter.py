@@ -6,7 +6,9 @@ real app was verified live and is recorded in the burst handoff instead.
 """
 from __future__ import annotations
 
+import inspect
 import unittest
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from standalone.bridge import ChatEndpoint, ChatEndpointRegistry, ChatGptAdapter
@@ -305,8 +307,27 @@ class DriverSurfaceTests(unittest.TestCase):
         result = UiaDriver().call("evil_operation", {})
         self.assertFalse(result.ok)
         self.assertEqual(result.reason_code, "driver-operation-not-allowlisted")
-        for forbidden in ("click_at", "type_keys", "run_script", "control_window", "launch_app"):
+        for forbidden in ("click_at", "type_keys", "run_script", "control_window",
+                          "start_process", "kill_app", "terminate_app"):
             self.assertNotIn(forbidden, DRIVER_OPERATIONS)
+
+    def test_UI_006b_the_only_launcher_is_the_fixed_accessibility_one(self):
+        """`launch_app` was added deliberately in Phase C2 and is not a general
+        process launcher: it names no executable, takes no arguments, refuses
+        while anything is running, and has no counterpart that ends a process."""
+        from standalone.bridge.uia import DRIVER_OPERATIONS, UiaDriver
+
+        launchers = [op for op in DRIVER_OPERATIONS if "launch" in op or "start" in op]
+        self.assertEqual(launchers, ["launch_app"])
+
+        source = (Path(__file__).resolve().parents[1] / "bridge" / "uia_driver.ps1").read_text(encoding="utf-8")
+        self.assertIn("launch-refused-already-running", source)
+        self.assertIn("--force-renderer-accessibility", source)
+        for verb in ("Stop-Process", "taskkill", "$_.Kill()", "CloseMainWindow"):
+            self.assertNotIn(verb, source, f"driver must never end the app ({verb})")
+
+        params = inspect.signature(UiaDriver.launch_app).parameters
+        self.assertEqual(list(params), ["self", "timeout_seconds"])
 
     def test_UI_007_no_driver_operation_accepts_coordinates(self):
         from standalone.bridge.uia import DRIVER_OPERATIONS
