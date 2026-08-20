@@ -1,8 +1,11 @@
 """Common transport adapter contract for Orbit.
 
 Unifies outbound and inbound communication across different tool surfaces
-(e.g., ChatGPT desktop UIA bridge, Antigravity Repository Steward bridge)
 without broadening execution authority.
+
+Status Classifications:
+- LIVE: Connected and validated against real desktop/remote surface.
+- CONTRACT_ONLY: Formal typed contract defined; no live external actuation claimed.
 """
 from __future__ import annotations
 
@@ -71,12 +74,15 @@ class BaseTransportAdapter(ABC):
 
 
 class AntigravityStewardAdapter(BaseTransportAdapter):
-    """Typed transport adapter for the Antigravity Repository Steward.
+    """Typed transport adapter definition for the Antigravity Repository Steward.
 
-    Provides a bounded mechanism for transporting accepted PM packets and
-    collecting signed steward receipts without exposing arbitrary Git or shell
-    authority.
+    Status: CONTRACT_ONLY.
+    Defines the typed interface for transporting accepted PM packets and
+    collecting signed steward receipts without claiming live external Antigravity
+    actuation or exposing arbitrary Git/shell authority.
     """
+
+    TRANSPORT_STATUS = "CONTRACT_ONLY"
 
     def __init__(self, workspace_root: Path, receipts_dir: Optional[Path] = None):
         self.workspace_root = Path(workspace_root)
@@ -85,14 +91,19 @@ class AntigravityStewardAdapter(BaseTransportAdapter):
 
     def surface_ready(self) -> Dict[str, Any]:
         return {
-            "ok": self.workspace_root.is_dir(),
-            "reason_code": "workspace-valid" if self.workspace_root.is_dir() else "workspace-missing",
-            "data": {"workspace_root": str(self.workspace_root)},
+            "ok": True,
+            "status": self.TRANSPORT_STATUS,
+            "reason_code": "steward-contract-only",
+            "data": {
+                "workspace_root": str(self.workspace_root),
+                "transport_status": self.TRANSPORT_STATUS,
+                "live_transport_connected": False,
+            },
         }
 
     def focus(self, endpoint_id: str) -> Dict[str, Any]:
         if endpoint_id in ("repository-steward", "git-steward"):
-            return {"ok": True, "reason_code": "steward-focused"}
+            return {"ok": True, "status": self.TRANSPORT_STATUS, "reason_code": "steward-focused"}
         return {"ok": False, "reason_code": "unknown-endpoint"}
 
     def deliver(
@@ -112,17 +123,23 @@ class AntigravityStewardAdapter(BaseTransportAdapter):
         if endpoint_id not in ("repository-steward", "git-steward"):
             return ChatTransportResult.deny("SEND_BOUNDED_MESSAGE", "unsupported-endpoint", delivery_state="FAILED")
 
-        # Record intent in ledger
+        # Record intent in ledger as STAGED_VERIFIED, not DELIVERED
         ledger.begin(
             request_id=request_id,
             endpoint_id=endpoint_id,
             message_digest=expected_sha256 or "packet-digest",
         )
-        ledger.mark_staged(request_id, artifact_digest="", message_digest=expected_sha256 or "packet-digest")
-        ledger.mark_actuating(request_id, artifact_digest="", message_digest=expected_sha256 or "packet-digest")
-        ledger.mark_sent(request_id)
-        record = ledger.mark_delivered(request_id, evidence={"steward": True})
-        return ChatTransportResult.allow("SEND_BOUNDED_MESSAGE", record, delivery_state="DELIVERED")
+        record = ledger.mark_staged(request_id, artifact_digest="", message_digest=expected_sha256 or "packet-digest")
+
+        # Refuse to claim fabricated external delivery success
+        return ChatTransportResult(
+            ok=True,
+            operation="SEND_BOUNDED_MESSAGE",
+            reason_code="steward-staged-contract-only",
+            detail="Packet staged and verified; external Antigravity transport is CONTRACT_ONLY.",
+            delivery_state="STAGED_CONTRACT_ONLY",
+            data=record,
+        )
 
     def collect_artifact(
         self,
@@ -135,7 +152,6 @@ class AntigravityStewardAdapter(BaseTransportAdapter):
     ) -> Dict[str, Any]:
         receipt_file = self.receipts_dir / expected_name
         if not receipt_file.is_file():
-            # Check workspace root
             receipt_file = self.workspace_root / expected_name
         if not receipt_file.is_file():
             return {"ok": False, "reason_code": "receipt-not-found"}

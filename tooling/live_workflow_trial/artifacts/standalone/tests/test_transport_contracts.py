@@ -24,17 +24,19 @@ class TestTransportContracts(unittest.TestCase):
     def test_implements_interface(self):
         self.assertIsInstance(self.adapter, BaseTransportAdapter)
 
-    def test_surface_ready(self):
+    def test_surface_ready_is_contract_only(self):
         res = self.adapter.surface_ready()
         self.assertTrue(res["ok"])
-        self.assertEqual(res["reason_code"], "workspace-valid")
+        self.assertEqual(res["status"], "CONTRACT_ONLY")
+        self.assertEqual(res["reason_code"], "steward-contract-only")
+        self.assertFalse(res["data"]["live_transport_connected"])
 
     def test_focus(self):
         self.assertTrue(self.adapter.focus("repository-steward")["ok"])
+        self.assertEqual(self.adapter.focus("repository-steward")["status"], "CONTRACT_ONLY")
         self.assertFalse(self.adapter.focus("unknown-role")["ok"])
 
-    def test_deliver_and_collect_receipt(self):
-        # Deliver packet
+    def test_deliver_stages_as_contract_only_without_claiming_fake_external_delivery(self):
         del_res = self.adapter.deliver(
             ledger=self.ledger,
             request_id="pm-req-001",
@@ -44,14 +46,19 @@ class TestTransportContracts(unittest.TestCase):
             expected_sha256="abc1234",
         )
         self.assertTrue(del_res.ok)
-        self.assertEqual(del_res.delivery_state, "DELIVERED")
+        self.assertEqual(del_res.delivery_state, "STAGED_CONTRACT_ONLY")
+        self.assertNotEqual(del_res.delivery_state, "DELIVERED")
 
-        # Fake steward creating a receipt
+        # Verify ledger state is STAGED_VERIFIED, never DELIVERED
+        rec = self.ledger.get("pm-req-001")
+        self.assertIsNotNone(rec)
+        self.assertEqual(rec["state"], "STAGED_VERIFIED")
+
+    def test_collect_receipt_from_workspace(self):
         receipt_name = "STEWARD_RECEIPT_WORK-TEST.md"
         receipt_file = self.receipts_dir / receipt_name
         receipt_file.write_text("# Steward Receipt Content", encoding="utf-8")
 
-        # Collect receipt
         col_res = self.adapter.collect_artifact(
             endpoint_id="repository-steward",
             expected_name=receipt_name,

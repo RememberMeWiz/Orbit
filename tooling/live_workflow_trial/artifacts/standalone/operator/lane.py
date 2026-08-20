@@ -3,9 +3,10 @@
 Guarantees:
 - Multiple work items do not share mutable workflow state.
 - One work item never consumes another work item's PM directive.
-- One lane blocking does not freeze unrelated safe lanes.
+- One lane blocking or holding does not freeze unrelated safe lanes.
 - Each lane has its own dedicated directory, PM bridge state, delivery ledger,
   teaching traces, inbox, and stop control.
+- Exact PM directive actions (HOLD, STOP, DISPATCH_TO_ROLE) are preserved.
 """
 from __future__ import annotations
 
@@ -30,6 +31,8 @@ def utc_now_iso() -> str:
 # Standard Work States
 STATE_INITIALIZED = "INITIALIZED"
 STATE_AWAITING_PM_ROUTING = "AWAITING_PM_ROUTING"
+STATE_HOLD = "HOLD"
+STATE_STOPPED = "STOPPED"
 STATE_DIRECTIVE_ACCEPTED = "DIRECTIVE_ACCEPTED"
 STATE_DISPATCHING = "DISPATCHING"
 STATE_AWAITING_WORKER = "AWAITING_WORKER"
@@ -38,7 +41,6 @@ STATE_REPORTING_TO_PM = "REPORTING_TO_PM"
 STATE_COMPLETED = "COMPLETED"
 STATE_PAUSED = "PAUSED"
 STATE_BLOCKED = "BLOCKED"
-STATE_STOPPED = "STOPPED"
 
 
 @dataclass
@@ -48,6 +50,7 @@ class LaneRecord:
     current_endpoint: str = ""
     pending_request_id: str = ""
     accepted_directive_id: str = ""
+    accepted_action: str = ""  # DISPATCH_TO_ROLE, HOLD, STOP, etc.
     expected_handoff: str = ""
     expected_sender: str = ""
     delivery_record_id: str = ""
@@ -163,6 +166,7 @@ class WorkItemLane:
             "current_endpoint": self.record.current_endpoint,
             "pending_request_id": self.record.pending_request_id,
             "accepted_directive_id": self.record.accepted_directive_id,
+            "accepted_action": self.record.accepted_action,
             "last_progress_at": self.record.last_progress_at,
             "stopped": self.stopped(),
             "blocker": self.record.blocker_code,

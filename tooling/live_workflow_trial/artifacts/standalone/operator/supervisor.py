@@ -4,10 +4,12 @@ Supervises multiple independent workflow lanes concurrently:
 - Reconstructs all lanes from durable state on startup.
 - Enforces strict isolation: work items never share mutable state or consume
   each other's directives.
-- One lane blocking never freezes unrelated safe lanes.
+- One lane blocking or holding never freezes unrelated safe lanes.
 - Enforces PM routing authority before any worker dispatch.
+- Preserves exact PM directive semantics (HOLD, STOP, DISPATCH_TO_ROLE).
 - Uses SingleWriterLock for exclusive local UIA actuation.
 - Deduplicates PM wake notifications.
+- Dynamically loads project and workflow scope from committed Orbit config.
 - Persists all progress, traces, and metrics.
 """
 from __future__ import annotations
@@ -30,6 +32,7 @@ from .lane import (
     STATE_COMPLETED,
     STATE_DIRECTIVE_ACCEPTED,
     STATE_DISPATCHING,
+    STATE_HOLD,
     STATE_INITIALIZED,
     STATE_PAUSED,
     STATE_REPORTING_TO_PM,
@@ -40,6 +43,15 @@ from .lane import (
 )
 from .telemetry import HopTelemetry, TelemetryStore
 
+DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent.parent / "bridge" / "orbit_endpoints.json"
+
+
+def load_orbit_config(config_path: Optional[Path] = None) -> Dict[str, Any]:
+    target = Path(config_path) if config_path else DEFAULT_CONFIG_PATH
+    if not target.is_file():
+        raise FileNotFoundError(f"Orbit endpoint config not found at: {target}")
+    return json.loads(target.read_text(encoding="utf-8"))
+
 
 class MultiWorkItemSupervisor:
     """Supervises and multiplexes multiple independent work-item lanes."""
@@ -49,6 +61,7 @@ class MultiWorkItemSupervisor:
         state_dir: Path,
         adapter: Optional[ChatGptAdapter] = None,
         *,
+        config_path: Optional[Path] = None,
         driver_timeout: float = 300.0,
         clock: Callable[[], float] = time.monotonic,
         sleeper: Callable[[float], None] = time.sleep,
@@ -59,19 +72,26 @@ class MultiWorkItemSupervisor:
         self.lanes_dir.mkdir(parents=True, exist_ok=True)
         self.global_stop_path = self.state_dir / "STOP"
         self.telemetry = TelemetryStore(self.state_dir / "telemetry.jsonl")
+        self.config_path = Path(config_path) if config_path else DEFAULT_CONFIG_PATH
+        self.config = load_orbit_config(self.config_path)
         self.driver_timeout = driver_timeout
         self._clock = clock
         self._sleep = sleeper
 
+        # Configured scope parameters directly from committed configuration
+        self.project_scope = str(self.config.get("project_scope", "Orbit"))
+        self.workflow_scope = str(self.config.get("workflow_scope", "orbit-m0-live-trial"))
+        self.chat_list_name = str(self.config.get("chat_list_name", "Chats in Yong 2"))
+
         if adapter is not None:
             self.adapter = adapter
         else:
-            registry = ChatEndpointRegistry.from_orbit_config()
+            registry = ChatEndpointRegistry.from_orbit_config(self.config_path)
             self.adapter = ChatGptAdapter(
                 registry,
-                project_scope="Orbit",
-                workflow_scope="live_workflow_trial",
-                chat_list_name="Chats in Yong 2",
+                project_scope=self.project_scope,
+                workflow_scope=self.workflow_scope,
+                chat_list_name=self.chat_list_name,
             )
             self.adapter.driver.timeout = driver_timeout
 
@@ -154,7 +174,7 @@ class MultiWorkItemSupervisor:
             return {"work_item": lane.work_item, "action": "STOPPED", "state": STATE_STOPPED}
         if lane.paused():
             return {"work_item": lane.work_item, "action": "PAUSED", "state": STATE_PAUSED}
-        if rec.work_state in (STATE_COMPLETED, STATE_BLOCKED):
+        if rec.work_state in (STATE_COMPLETED, STATE_BLOCKED, STATE_HOLD):
             return {"work_item": lane.work_item, "action": "IDLE", "state": rec.work_state}
 
         loop = lane.build_loop(self.adapter)
@@ -187,23 +207,82 @@ class MultiWorkItemSupervisor:
                 verdict = loop.pm_state.evaluate(str(tail.data.get("text", "")))
                 if verdict.accepted and verdict.directive:
                     directive: PMDirective = verdict.directive
-                    # Enforce strict work item isolation
+                    # Enforce strict work item matching
                     if directive.work_item == lane.work_item:
                         rec.accepted_directive_id = directive.directive_id
-                        rec.current_endpoint = directive.target_endpoint
-                        rec.work_state = STATE_DIRECTIVE_ACCEPTED
-                        lane.save_record()
+                        rec.accepted_action = directive.action
                         loop.consume(directive)
-                        return {
-                            "work_item": lane.work_item,
-                            "action": "DIRECTIVE_ACCEPTED",
-                            "directive": directive.to_dict(),
-                            "state": rec.work_state,
-                        }
+
+                        # EXACT PM DIRECTIVE SEMANTICS PRESERVATION
+                        if directive.action == "HOLD":
+                            rec.work_state = STATE_HOLD
+                            lane.save_record()
+                            loop.record(
+                                directive=directive,
+                                action="HOLD",
+                                state_before={"work_state": STATE_AWAITING_PM_ROUTING},
+                                state_after={"work_state": STATE_HOLD},
+                                evidence={"notes": directive.notes},
+                                result="held",
+                                classification="success",
+                                reason="pm-directed-hold",
+                            )
+                            return {
+                                "work_item": lane.work_item,
+                                "action": "PM_DIRECTED_HOLD",
+                                "directive": directive.to_dict(),
+                                "state": rec.work_state,
+                            }
+
+                        elif directive.action == "STOP":
+                            lane.stop()
+                            loop.record(
+                                directive=directive,
+                                action="STOP",
+                                state_before={"work_state": STATE_AWAITING_PM_ROUTING},
+                                state_after={"work_state": STATE_STOPPED},
+                                evidence={"notes": directive.notes},
+                                result="stopped",
+                                classification="success",
+                                reason="pm-directed-stop",
+                            )
+                            return {
+                                "work_item": lane.work_item,
+                                "action": "PM_DIRECTED_STOP",
+                                "directive": directive.to_dict(),
+                                "state": rec.work_state,
+                            }
+
+                        elif directive.action == "DISPATCH_TO_ROLE":
+                            rec.current_endpoint = directive.target_endpoint
+                            rec.work_state = STATE_DIRECTIVE_ACCEPTED
+                            lane.save_record()
+                            return {
+                                "work_item": lane.work_item,
+                                "action": "DIRECTIVE_ACCEPTED",
+                                "directive": directive.to_dict(),
+                                "state": rec.work_state,
+                            }
+                        else:
+                            rec.work_state = STATE_BLOCKED
+                            rec.blocker_code = f"unsupported-directive-action:{directive.action}"
+                            lane.save_record()
+                            return {
+                                "work_item": lane.work_item,
+                                "action": "UNSUPPORTED_DIRECTIVE_ACTION",
+                                "state": rec.work_state,
+                            }
+
             return {"work_item": lane.work_item, "action": "AWAITING_PM_DIRECTIVE", "state": rec.work_state}
 
-        # 3. DIRECTIVE_ACCEPTED / DISPATCHING -> Dispatch to target endpoint
+        # 3. DIRECTIVE_ACCEPTED / DISPATCHING -> Dispatch only if action is DISPATCH_TO_ROLE
         if rec.work_state in (STATE_DIRECTIVE_ACCEPTED, STATE_DISPATCHING):
+            if rec.accepted_action != "DISPATCH_TO_ROLE":
+                rec.work_state = STATE_BLOCKED
+                rec.blocker_code = f"cannot-dispatch-non-dispatch-action:{rec.accepted_action}"
+                lane.save_record()
+                return {"work_item": lane.work_item, "action": "DISPATCH_REFUSED", "state": rec.work_state}
+
             directive_id = rec.accepted_directive_id
             target_ep = rec.current_endpoint
             if not target_ep:
@@ -219,12 +298,12 @@ class MultiWorkItemSupervisor:
             )
             artifact_file = Path(rec.artifact_path) if rec.artifact_path and Path(rec.artifact_path).is_file() else None
 
-            # Reconstruct directive object
+            # Reconstruct directive object with exact preserved action
             directive = PMDirective(
                 directive_id=directive_id,
                 request_id=rec.pending_request_id,
                 work_item=lane.work_item,
-                action="DISPATCH_TO_ROLE",
+                action=rec.accepted_action,
                 target_endpoint=target_ep,
             )
 
@@ -337,17 +416,22 @@ class MultiWorkItemSupervisor:
         self.load_lanes()
         surface = self.check_surface(allow_launch=False)
         lane_summaries = [l.summary_dict() for l in self.list_lanes()]
-        active_count = sum(1 for l in lane_summaries if l["work_state"] not in (STATE_COMPLETED, STATE_BLOCKED, STATE_STOPPED))
+        active_count = sum(1 for l in lane_summaries if l["work_state"] not in (STATE_COMPLETED, STATE_BLOCKED, STATE_STOPPED, STATE_HOLD))
         blocked_count = sum(1 for l in lane_summaries if l["work_state"] == STATE_BLOCKED)
         completed_count = sum(1 for l in lane_summaries if l["work_state"] == STATE_COMPLETED)
+        hold_count = sum(1 for l in lane_summaries if l["work_state"] == STATE_HOLD)
 
         return {
             "stopped": self.stopped(),
             "surface": surface,
+            "project_scope": self.project_scope,
+            "workflow_scope": self.workflow_scope,
+            "chat_list_name": self.chat_list_name,
             "total_lanes": len(lane_summaries),
             "active_lanes": active_count,
             "blocked_lanes": blocked_count,
             "completed_lanes": completed_count,
+            "hold_lanes": hold_count,
             "lanes": lane_summaries,
             "telemetry_summary": self.telemetry.summary(),
         }

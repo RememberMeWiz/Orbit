@@ -1,11 +1,11 @@
-"""Tests for Orbit MultiWorkItemSupervisor and lane isolation."""
+"""Tests for Orbit MultiWorkItemSupervisor, lane isolation, exact directive semantics, and workflow scope."""
 import json
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock
 
-from standalone.bridge.contracts import ChatTransportResult
+from standalone.bridge.contracts import BridgeError, ChatTransportResult
 from standalone.bridge.pm_envelope import DirectiveVerdict, PMDirective
 from standalone.operator.lane import (
     STATE_AWAITING_PM_ROUTING,
@@ -13,13 +13,14 @@ from standalone.operator.lane import (
     STATE_BLOCKED,
     STATE_COMPLETED,
     STATE_DIRECTIVE_ACCEPTED,
+    STATE_HOLD,
     STATE_INITIALIZED,
     STATE_PAUSED,
     STATE_REPORTING_TO_PM,
     STATE_STOPPED,
     WorkItemLane,
 )
-from standalone.operator.supervisor import MultiWorkItemSupervisor
+from standalone.operator.supervisor import MultiWorkItemSupervisor, load_orbit_config
 
 
 class TestMultiWorkItemSupervisor(unittest.TestCase):
@@ -32,6 +33,14 @@ class TestMultiWorkItemSupervisor(unittest.TestCase):
 
     def tearDown(self):
         self.tmp.cleanup()
+
+    def test_workflow_scope_loaded_from_committed_config(self):
+        config = load_orbit_config()
+        self.assertEqual(self.supervisor.project_scope, config["project_scope"])
+        self.assertEqual(self.supervisor.workflow_scope, config["workflow_scope"])
+        self.assertEqual(self.supervisor.chat_list_name, config["chat_list_name"])
+        self.assertEqual(self.supervisor.workflow_scope, "orbit-m0-live-trial")
+        self.assertNotEqual(self.supervisor.workflow_scope, "live_workflow_trial")
 
     def test_create_and_load_lanes(self):
         lane1 = self.supervisor.create_lane("WORK-001", "Objective 1")
@@ -124,7 +133,84 @@ class TestMultiWorkItemSupervisor(unittest.TestCase):
         self.assertEqual(step_res1["action"], "DIRECTIVE_ACCEPTED")
         self.assertEqual(lane1.record.work_state, STATE_DIRECTIVE_ACCEPTED)
         self.assertEqual(lane1.record.accepted_directive_id, "dir-001")
+        self.assertEqual(lane1.record.accepted_action, "DISPATCH_TO_ROLE")
         self.assertEqual(lane1.record.current_endpoint, "windows-worker")
+
+    def test_pm_directive_exact_semantics_hold(self):
+        """HOLD directive must transition to STATE_HOLD, must NOT dispatch, and must persist across restart."""
+        lane = self.supervisor.create_lane("WORK-HOLD", "Hold test objective")
+        self.mock_adapter.deliver.return_value = ChatTransportResult.allow("SEND_BOUNDED_MESSAGE", {}, delivery_state="DELIVERED")
+
+        self.supervisor.step_lane(lane)
+        self.assertEqual(lane.record.work_state, STATE_AWAITING_PM_ROUTING)
+
+        # PM replies with HOLD
+        self.mock_adapter.focus.return_value = MagicMock(ok=True)
+        directive_text = (
+            "ChatGPT said:\n"
+            "```\n"
+            "ORBIT_DIRECTIVE\n"
+            "version: 0.1\n"
+            f"request_id: {lane.record.pending_request_id}\n"
+            "directive_id: dir-hold-001\n"
+            "work_item: WORK-HOLD\n"
+            "action: HOLD\n"
+            "reason: awaiting user confirmation\n"
+            "```"
+        )
+        self.mock_adapter.driver.read_transcript_tail.return_value = MagicMock(ok=True, data={"text": directive_text})
+
+        step_res = self.supervisor.step_lane(lane)
+        self.assertEqual(step_res["action"], "PM_DIRECTED_HOLD")
+        self.assertEqual(lane.record.work_state, STATE_HOLD)
+        self.assertEqual(lane.record.accepted_action, "HOLD")
+        self.assertEqual(lane.record.accepted_directive_id, "dir-hold-001")
+
+        # Subsequent steps must be IDLE / NO-OP, never dispatch
+        step_res_again = self.supervisor.step_lane(lane)
+        self.assertEqual(step_res_again["action"], "IDLE")
+        self.assertEqual(lane.record.work_state, STATE_HOLD)
+
+        # Verify state persistence across restart
+        restarted = MultiWorkItemSupervisor(self.state_dir, adapter=self.mock_adapter)
+        reloaded_lane = restarted.get_lane("WORK-HOLD")
+        self.assertEqual(reloaded_lane.record.work_state, STATE_HOLD)
+        self.assertEqual(reloaded_lane.record.accepted_action, "HOLD")
+
+    def test_pm_directive_exact_semantics_stop(self):
+        """STOP directive must halt the lane, create STOP file, and must NOT dispatch."""
+        lane = self.supervisor.create_lane("WORK-STOP", "Stop test objective")
+        self.mock_adapter.deliver.return_value = ChatTransportResult.allow("SEND_BOUNDED_MESSAGE", {}, delivery_state="DELIVERED")
+
+        self.supervisor.step_lane(lane)
+        self.assertEqual(lane.record.work_state, STATE_AWAITING_PM_ROUTING)
+
+        # PM replies with STOP
+        self.mock_adapter.focus.return_value = MagicMock(ok=True)
+        directive_text = (
+            "ChatGPT said:\n"
+            "```\n"
+            "ORBIT_DIRECTIVE\n"
+            "version: 0.1\n"
+            f"request_id: {lane.record.pending_request_id}\n"
+            "directive_id: dir-stop-001\n"
+            "work_item: WORK-STOP\n"
+            "action: STOP\n"
+            "reason: security policy violation\n"
+            "```"
+        )
+        self.mock_adapter.driver.read_transcript_tail.return_value = MagicMock(ok=True, data={"text": directive_text})
+
+        step_res = self.supervisor.step_lane(lane)
+        self.assertEqual(step_res["action"], "PM_DIRECTED_STOP")
+        self.assertEqual(lane.record.work_state, STATE_STOPPED)
+        self.assertEqual(lane.record.accepted_action, "STOP")
+        self.assertTrue(lane.stopped())
+        self.assertTrue(lane.stop_path.is_file())
+
+        # Subsequent steps must return STOPPED
+        step_res_again = self.supervisor.step_lane(lane)
+        self.assertEqual(step_res_again["action"], "STOPPED")
 
     def test_one_lane_blocked_does_not_freeze_other(self):
         lane1 = self.supervisor.create_lane("WORK-001", "Objective 1")
