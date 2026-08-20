@@ -171,7 +171,7 @@ class CliTests(unittest.TestCase):
     def test_EP_031_cli_exposes_every_loop_step(self):
         from standalone.bridge import apprentice_cli
 
-        for verb in ("status", "wake", "poll", "dispatch", "await", "collect", "clear"):
+        for verb in ("status", "wake", "poll", "dispatch", "await", "collect", "cycle", "clear"):
             with self.assertRaises(SystemExit):
                 apprentice_cli.main(["--state-dir", ".", "--work-item", "W", verb, "--help"])
 

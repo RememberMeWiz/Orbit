@@ -11,6 +11,7 @@ ordinary restart rather than a special case.
     dispatch   carry out the accepted directive
     await      wait for the target conversation to finish responding
     collect    materialise and validate the expected artifact
+    cycle      all of the above as one governed round trip
     clear      remove staged attachments after an abandoned dispatch
 
 Nothing here decides routing. `dispatch` acts only on a directive PM already
@@ -29,6 +30,7 @@ from .delivery import DeliveryLedger
 from .orchestrator import ApprenticeLoop
 from .pm_envelope import PMBridgeState, PMDirective
 from .registry import ChatEndpointRegistry
+from .roundtrip import RoundTrip
 from .teaching import TeachingTraceStore
 
 CONFIG = Path(__file__).with_name("orbit_endpoints.json")
@@ -178,6 +180,30 @@ def cmd_collect(loop: ApprenticeLoop, args) -> int:
     return emit({"ok": out.action == "COLLECTED", **out.to_dict()})
 
 
+def cmd_cycle(loop: ApprenticeLoop, args) -> int:
+    """One full zero-courier round trip, PM decision included."""
+    cycle = RoundTrip(
+        loop,
+        journal_path=Path(args.state_dir) / "roundtrip_journal.jsonl",
+        allow_launch=not args.no_launch,
+        observer=lambda step, entry: print(
+            f"[{entry['at']}] {step}: {entry.get('action') or entry.get('status')}"
+            f" {entry.get('reason_code', '')}".rstrip(), flush=True),
+    )
+    result = cycle.run(
+        reason=args.reason,
+        nonce=args.nonce,
+        assignment=Path(args.assignment).read_text(encoding="utf-8"),
+        verify_token=args.token,
+        expected_artifact=args.expect,
+        artifact_path=Path(args.artifact) if args.artifact else None,
+        expected_sender=args.sender,
+        pm_timeout=args.pm_timeout,
+        worker_timeout=args.worker_timeout,
+    )
+    return emit({"ok": result.completed, **result.to_dict()})
+
+
 def cmd_clear(loop: ApprenticeLoop, args) -> int:
     blocked = preflight(loop, args)
     if blocked:
@@ -225,6 +251,18 @@ def main(argv=None) -> int:
     collect.add_argument("--expect", required=True)
     collect.add_argument("--sender", default="")
     collect.set_defaults(func=cmd_collect)
+
+    cycle = sub.add_parser("cycle", help="run one full PM -> worker -> PM round trip")
+    cycle.add_argument("--reason", required=True, help="what Orbit is asking PM to decide")
+    cycle.add_argument("--nonce", required=True)
+    cycle.add_argument("--assignment", required=True, help="file containing the assignment text")
+    cycle.add_argument("--token", required=True, help="string that must appear in the composer")
+    cycle.add_argument("--expect", required=True, help="filename the worker must return")
+    cycle.add_argument("--artifact", default="", help="file to attach to the assignment")
+    cycle.add_argument("--sender", default="")
+    cycle.add_argument("--pm-timeout", type=float, default=1800.0)
+    cycle.add_argument("--worker-timeout", type=float, default=1800.0)
+    cycle.set_defaults(func=cmd_cycle)
 
     sub.add_parser("clear").set_defaults(func=cmd_clear)
 

@@ -119,6 +119,24 @@ class PMDirective:
             "notes": self.notes,
         }
 
+    @classmethod
+    def from_dict(cls, payload: Dict[str, Any]) -> "PMDirective":
+        """Rebuild a directive that was journalled or passed between steps.
+
+        Unknown keys are dropped rather than accepted: a directive is only ever
+        the fields the parser recognises, so a round trip through JSON cannot
+        smuggle an extra one back in.
+        """
+        return cls(
+            directive_id=str(payload.get("directive_id", "")),
+            request_id=str(payload.get("request_id", "")),
+            work_item=str(payload.get("work_item", "")),
+            action=str(payload.get("action", "")),
+            target_endpoint=str(payload.get("target_endpoint", "")),
+            artifact_id=str(payload.get("artifact_id", "")),
+            notes=str(payload.get("notes", "")),
+        )
+
 
 @dataclass(frozen=True)
 class DirectiveVerdict:
