@@ -51,6 +51,7 @@ class StubDriver:
         self.artifacts = {"saveable": [], "previewable": []}
         self.attached: List[str] = []
         self.attach_result = None
+        self.transcript = ""
         self.__dict__.update(overrides)
 
     def snapshot(self, chat_list_name=""):
@@ -107,6 +108,10 @@ class StubDriver:
         removed = list(self.attached)
         self.attached = []
         return ok({"removed": removed, "remaining": []})
+
+    def read_transcript_tail(self, max_chars=6000):
+        self.calls.append("read_transcript_tail")
+        return ok({"text": self.transcript, "nodes": 1, "total_length": len(self.transcript)})
 
     def call(self, operation, params=None):
         return getattr(self, operation)()
