@@ -5,12 +5,12 @@
 
 | Field | Value |
 | :--- | :--- |
-| Updated | 2026-08-21T02:20Z |
-| Branch | `claude/m0-autonomous-longrun-001` |
+| Updated | 2026-08-21T18:05Z |
+| Branch | `claude/m0-operator-reconcile-001` (from `antigravity/m0-overnight-operator-001`) |
 | Started from | `446e43af18445067a9bc227bb810ce17069929cf` (head of `claude/m0-wf-apprentice-002`) |
-| HEAD | `1dce4ec` |
-| Current phase | **B — live zero-courier trial** |
-| Current objective | E — multi-endpoint supervision, then F/G Steward transport |
+| HEAD | `a1a4c54` |
+| Current phase | **Workflow-first mainline** (per 05:11 resume briefing) |
+| Current objective | operator UX + overnight, then Steward transport |
 | Blocker | NONE |
 
 ---
@@ -152,10 +152,10 @@ for supervised runs.
 
 ```text
 workflow     67 pass
-standalone  352 pass   (2 skipped: symlink creation needs Developer Mode;
+standalone  403 pass   (2 skipped: symlink creation needs Developer Mode;
                         Windows junction coverage supersedes them)
 native       14 pass
-TOTAL       433 pass, 2 skipped, 0 release-blocking skips
+TOTAL       484 pass, 2 skipped, 0 release-blocking skips
 ```
 
 ---
@@ -289,6 +289,55 @@ Claim narrowed to what is true:
 
 Not exactly-once remote delivery, and no constraint on a human pressing Send in
 the same conversation.
+
+### Multi-lane supervision — PROVEN LIVE · `1753273`
+
+Two independent work items, two different registered endpoints, one shared
+window. Evidence and full journal in `longrun/evidence/twolane/`.
+
+```text
+r1  A PM_WOKEN                 B WAITING_FOR_TURN   <- window busy
+r2  A DIRECTIVE_ACCEPTED       B PM_WOKEN           <- got its turn
+r3  A DISPATCHED               B DIRECTIVE_ACCEPTED
+r4  A WORKER_IDLE_TRY_COLLECT  B DISPATCHED
+r5  A COLLECTED                B WORKER_IDLE_TRY_COLLECT
+r6  A REPORTED_TO_PM COMPLETED B COLLECTED
+r7                             B REPORTED_TO_PM COMPLETED
+```
+
+Request ids distinct and not crossed, handoffs bound to their own work item,
+6 sends with no duplicates, 0 courier actions, 0 human UI clicks. Send counts
+came from wrapping the adapter, not from the supervisor's own account.
+
+**Five earlier runs failed first**, each a real defect the 465-test mocked suite
+passed over: a worker wait that could never complete; contention treated as
+terminal failure; edge-triggered completion missed by a slow poller; nested
+assistant turns inflating one handoff into two; and finally the harness reusing
+work-item identity across runs, which was fixed in the harness rather than by
+loosening the collector.
+
+Not proven: an explicit PM `HOLD` on one lane while another runs to completion.
+The trial showed turn-taking under contention, which is a different thing.
+
+### Antigravity R2 reconciliation — `4ae8f05`, `a1a4c54`
+
+Reviewed against PM's correction memo rather than against its test count.
+
+| finding | verdict |
+| :--- | :--- |
+| A — directive semantics preserved | real |
+| B — scope from committed config | real, but defaulted in code; now fails closed |
+| C — "live" two-lane trial | **false** — the adapter was a `MagicMock` |
+| D — Steward `CONTRACT_ONLY` | real |
+
+C's test is kept and renamed `test_multilane_supervision.py`; a test claiming
+live proof while mocking the surface is worse than no test.
+
+Two later corrections to the window-discovery hardening: a synthetic global ALT
+keystroke removed (injected precisely when the target is not in front, which is
+the invariant the driver holds), and window trust re-checked against the process
+that actually owns the discovered window rather than whichever was enumerated
+first.
 
 ## Defects found live, all fixed
 
