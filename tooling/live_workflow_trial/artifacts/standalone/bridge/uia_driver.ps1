@@ -942,6 +942,16 @@ switch ($Operation) {
     # Non-degenerate means several distinct control types over a real number of
     # nodes. A window whose renderer exposes nothing still reports its frame, so
     # "more than nothing" is the wrong bar.
+    #
+    # The floor of 25 is measured, not guessed. The Steward's A11Y restart test
+    # (STEWARD_RECEIPT_M0-WF-APPRENTICE-CHATGPT-A11Y-001) sampled the same app
+    # with and without the flag on this host:
+    #
+    #     no flag : 12 descendants, 0 Document, 0 Edit, 3 Buttons (frame only)
+    #     flagged : 275 descendants, 1 Document, 1 ProseMirror Edit, 110 Buttons
+    #
+    # So 25 sits above the observed flagless ceiling and far below the flagged
+    # floor. A chat view on this host currently reports ~600-800.
     $semantics = ($hasDoc -and $descendants -ge 25 -and $types.Count -ge 3)
 
     Done @{
