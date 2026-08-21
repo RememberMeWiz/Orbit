@@ -167,10 +167,24 @@ def assistant_turns(text: str) -> List[str]:
     fails closed on an empty list.
     """
     turns: List[str] = []
-    for match in ASSISTANT_MARKER.finditer(text):
-        rest = text[match.end():]
-        nxt = USER_MARKER.search(rest)
-        turns.append(rest[:nxt.start()] if nxt else rest)
+    starts = [m for m in ASSISTANT_MARKER.finditer(text)]
+    for index, match in enumerate(starts):
+        # A turn ends at the next marker of *either* kind.
+        #
+        # It used to end only at the next user marker, so two assistant turns in
+        # a row produced nested regions: the first ran past the second and
+        # contained it. Anything inside then counted once per enclosing turn,
+        # which showed up live as `transcript-handoff-ambiguous: 2 eligible
+        # blocks` for a conversation containing exactly one handoff. Two
+        # consecutive assistant turns are completely ordinary -- a short
+        # acknowledgement followed by the real answer is enough.
+        stop = len(text)
+        nxt_user = USER_MARKER.search(text, match.end())
+        if nxt_user:
+            stop = min(stop, nxt_user.start())
+        if index + 1 < len(starts):
+            stop = min(stop, starts[index + 1].start())
+        turns.append(text[match.end():stop])
     return turns
 
 

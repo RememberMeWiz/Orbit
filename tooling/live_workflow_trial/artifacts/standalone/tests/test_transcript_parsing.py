@@ -154,6 +154,22 @@ class ProvenanceTests(unittest.TestCase):
         turns = assistant_turns(ASSISTANT + "A\n" + USER + "B\n" + ASSISTANT + "C")
         self.assertEqual([t.strip() for t in turns], ["A", "C"])
 
+    def test_TR_046_consecutive_assistant_turns_do_not_nest(self):
+        """Found live: one handoff counted twice and refused as ambiguous.
+
+        A turn that ran on until the next *user* marker swallowed the assistant
+        turns after it, so anything inside was counted once per enclosing turn.
+        Two assistant turns in a row is completely ordinary — an acknowledgement
+        followed by the real answer is enough to produce it.
+        """
+        turns = assistant_turns(ASSISTANT + "A\n" + ASSISTANT + "B\n" + USER + "C")
+        self.assertEqual([t.strip() for t in turns], ["A", "B"])
+
+    def test_TR_047_a_directive_is_not_counted_once_per_enclosing_turn(self):
+        directive, reason = parse_envelope(ASSISTANT + "on it\n" + ASSISTANT + body("dir-once"))
+        self.assertIsNotNone(directive, reason)
+        self.assertEqual(directive.directive_id, "dir-once")
+
     def test_TR_045_trusted_channel_parsing_is_opt_in_only(self):
         """Callers holding a known-good body may skip provenance, explicitly."""
         directive, _ = parse_envelope(body("dir-trusted"), require_assistant_turn=False)

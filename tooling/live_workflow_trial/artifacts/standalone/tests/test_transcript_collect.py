@@ -142,6 +142,23 @@ class ProvenanceTests(CollectBase):
         self.assertEqual(result.reason_code, "transcript-handoff-not-found")
 
 
+class TurnBoundaryTests(CollectBase):
+    """One handoff must count once, however the assistant split its message."""
+
+    def test_TC_040_an_acknowledgement_before_the_handoff_is_not_ambiguity(self):
+        """Found live: lane A blocked with '2 eligible blocks' for one handoff."""
+        text = "ChatGPT said:\nOn it.\n" + turn(HANDOFF)
+        result = self.collect(text)
+        self.assertTrue(result.ok, f"{result.reason_code}: {result.detail}")
+        self.assertEqual(result.data["candidates_seen"], 1)
+
+    def test_TC_041_two_genuine_handoffs_are_still_ambiguous(self):
+        """The guard must not have been weakened into uselessness."""
+        result = self.collect(turn(HANDOFF) + turn(HANDOFF))
+        self.assertFalse(result.ok)
+        self.assertEqual(result.reason_code, "transcript-handoff-ambiguous")
+
+
 class RefusalTests(CollectBase):
     def test_TC_020_a_block_named_something_else_is_not_the_expected_one(self):
         result = self.collect(turn(HANDOFF, name="HANDOFF_M0-WF-TRANSCRIPT-TEST_QA_TO_ORBIT.md"))
