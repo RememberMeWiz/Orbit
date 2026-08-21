@@ -429,6 +429,33 @@ class DriverSurfaceTests(unittest.TestCase):
         params = inspect.signature(UiaDriver.launch_app).parameters
         self.assertEqual(list(params), ["self", "timeout_seconds"])
 
+    def test_UI_006c_the_driver_injects_no_unguarded_global_input(self):
+        """Every keystroke goes through the foreground-verified helper.
+
+        A synthetic ALT press was added during a hardening pass as the standard
+        SetForegroundWindow unlock trick. It is a *global* keystroke delivered at
+        the one moment the target is provably not in front, which is the exact
+        invariant this driver holds — and a bare ALT opens the menu bar of
+        whatever the operator is actually using. AttachThreadInput already grants
+        the foreground-change right without injecting anything.
+        """
+        source = (Path(__file__).resolve().parents[1] / "bridge" / "uia_driver.ps1").read_text(encoding="utf-8")
+        self.assertNotIn("keybd_event", source)
+        self.assertNotIn("SendInput", source)
+
+        # SendKeys appears only inside Send-KeysTo, which verifies foreground.
+        sendkeys_lines = [line for line in source.splitlines()
+                          if "SendKeys" in line and not line.strip().startswith("#")]
+        self.assertEqual(len(sendkeys_lines), 1, sendkeys_lines)
+
+    def test_UI_006d_window_trust_is_checked_on_the_window_owner(self):
+        """A trusted background instance must not vouch for another's window."""
+        source = (Path(__file__).resolve().parents[1] / "bridge" / "uia_driver.ps1").read_text(encoding="utf-8")
+        discovery = source[source.index("function Get-ChatWindow"):]
+        discovery = discovery[:discovery.index("function All-Descendants")]
+        self.assertIn("GetWindowThreadProcessId", discovery)
+        self.assertIn("chat-window-owner-unknown", discovery)
+
     def test_UI_007_no_driver_operation_accepts_coordinates(self):
         from standalone.bridge.uia import DRIVER_OPERATIONS
         for op in DRIVER_OPERATIONS:

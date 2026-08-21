@@ -25,7 +25,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
-from .lane import STATE_BLOCKED, STATE_COMPLETED, STATE_STOPPED
+from .lane import STATE_BLOCKED, STATE_COMPLETED, STATE_HOLD, STATE_STOPPED
 from .supervisor import MultiWorkItemSupervisor
 
 
@@ -100,7 +100,7 @@ class OvernightRunner:
 
                 cycle_count += 1
                 lanes = self.supervisor.list_lanes()
-                active_lanes = [l for l in lanes if not l.stopped() and not l.paused() and l.record.work_state not in (STATE_COMPLETED, STATE_BLOCKED, "HOLD")]
+                active_lanes = [l for l in lanes if not l.stopped() and not l.paused() and l.record.work_state not in (STATE_COMPLETED, STATE_BLOCKED, STATE_HOLD)]
 
                 # Execute one pass over all active lanes
                 cycle_results = self.supervisor.cycle_all()

@@ -45,7 +45,6 @@ public class OrbitCursor {
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int cmd);
     [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr h);
     [DllImport("user32.dll")] public static extern void SwitchToThisWindow(IntPtr h, bool fAltTab);
-    [DllImport("user32.dll")] public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, int dwExtraInfo);
     [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint a, uint b, bool attach);
     [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
     [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
@@ -127,9 +126,19 @@ function Bring-ChatToFront([IntPtr]$hwnd) {
     $fg = [OrbitCursor]::GetForegroundWindow()
     $fgThread = [OrbitCursor]::GetWindowThreadProcessId($fg, [ref]([int]0))
     $ourThread = [OrbitCursor]::GetCurrentThreadId()
+    # NOTE: no synthetic ALT keypress here, deliberately.
+    #
+    # Injecting VK_MENU is the well-known trick for unlocking
+    # SetForegroundWindow, and it was added here during hardening. But it is a
+    # *global* keystroke delivered at the one moment the target is provably not
+    # in front, which is precisely the invariant the rest of this driver holds:
+    # no keystroke reaches a window that is not verifiably foreground. A bare
+    # ALT activates the menu bar of whatever the operator is actually using.
+    #
+    # It is also unnecessary here. AttachThreadInput already grants the
+    # foreground-change right, and six consecutive live two-lane runs raised the
+    # window with the attach path alone.
     [void][OrbitCursor]::AttachThreadInput($fgThread, $ourThread, $true)
-    [OrbitCursor]::keybd_event(0x12, 0, 0, 0)
-    [OrbitCursor]::keybd_event(0x12, 0, 2, 0)
     [void][OrbitCursor]::ShowWindow($hwnd, 9)   # SW_RESTORE
     [void][OrbitCursor]::SetForegroundWindow($hwnd)
     [void][OrbitCursor]::BringWindowToTop($hwnd)
@@ -223,8 +232,19 @@ function Get-ChatWindow {
   } else {
     $pids = [int[]]@($procs | ForEach-Object { $_.Id })
     $hwnd = [OrbitDesktop]::FindChatHwnd($pids)
-    $proc = $procs | Select-Object -First 1
-    if ($proc.Path -and $proc.Path -notlike "*OpenAI.Codex*") { Fail "chat-app-untrusted-path" $proc.Path }
+
+    # Trust is verified against the process that actually owns the window we
+    # found, not against whichever process happened to be enumerated first.
+    # Checking a different process is how a trusted background instance lends
+    # its credentials to a window nobody verified -- the same correlation defect
+    # the Architecture review caught in app_state.
+    if ($hwnd -ne [IntPtr]::Zero) {
+      $ownerPid = 0
+      [void][OrbitCursor]::GetWindowThreadProcessId($hwnd, [ref]$ownerPid)
+      $proc = $procs | Where-Object { $_.Id -eq $ownerPid } | Select-Object -First 1
+      if (-not $proc) { Fail "chat-window-owner-unknown" "pid $ownerPid" }
+      if ($proc.Path -and $proc.Path -notlike "*OpenAI.Codex*") { Fail "chat-app-untrusted-path" $proc.Path }
+    }
   }
   if ($hwnd -eq [IntPtr]::Zero) { Fail "chat-window-unavailable" }
   $el = $UIA::FromHandle($hwnd)
