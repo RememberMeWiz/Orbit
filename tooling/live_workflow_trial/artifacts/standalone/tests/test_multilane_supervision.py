@@ -43,7 +43,7 @@ from standalone.operator.lane import (
 from standalone.operator.supervisor import MultiWorkItemSupervisor, load_orbit_config
 
 
-class LiveMultiLaneTrialTests(unittest.TestCase):
+class MultiLaneSupervisionTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.state_dir = Path(self.tmp.name) / "state"
@@ -53,6 +53,26 @@ class LiveMultiLaneTrialTests(unittest.TestCase):
 
     def tearDown(self):
         self.tmp.cleanup()
+
+    def _drive_worker_to_idle(self, lane=None):
+        """Streaming, then idle long enough to count as finished."""
+        from standalone.bridge.chatgpt import IDLE_CONFIRM_SECONDS
+
+        states = ["streaming", "idle", "idle"]
+        clock = {"t": 0.0}
+
+        def next_state():
+            value = states.pop(0) if len(states) > 1 else states[0]
+            return MagicMock(ok=True, data={"state": value},
+                             reason_code="ok")
+
+        self.mock_adapter.driver.response_state.side_effect = lambda: next_state()
+
+        def advancing_clock():
+            clock["t"] += IDLE_CONFIRM_SECONDS
+            return clock["t"]
+
+        self.supervisor._clock = advancing_clock
 
     def test_live_two_lane_independent_multiplexing(self):
         # 1. Register two independent work items targeting distinct registered endpoints
@@ -151,7 +171,16 @@ class LiveMultiLaneTrialTests(unittest.TestCase):
         self.assertEqual(lane_b.record.accepted_action, "HOLD")
 
         # 6. Prove Lane B in HOLD does not impede Lane A from advancing
-        self.mock_adapter.wait_for_response.return_value = MagicMock(state="complete")
+        # The supervisor samples driver.response_state() once per cycle and keeps
+        # the streaming/idle evidence on the lane record, so the stub has to
+        # model that rather than hand back a finished verdict.
+        #
+        # It previously stubbed `wait_for_response` to return complete, which is
+        # what hid a real defect: the supervisor called that with timeout=0.0,
+        # which can never return complete because the routine needs several
+        # polls of its own to conclude. The stub answered the question the code
+        # was not actually asking.
+        self._drive_worker_to_idle()
         handoff_a_content = (
             "ORBIT_HANDOFF_BEGIN HANDOFF_WORK-A.md\n"
             "work_item: WORK-A\n"
@@ -175,7 +204,16 @@ class LiveMultiLaneTrialTests(unittest.TestCase):
         (lane_a.inbox_dir / "HANDOFF_WORK-A.md").write_text(handoff_a_content, encoding="utf-8")
 
         # Step Lane A: AWAITING_WORKER -> COLLECTING
-        step_a3 = self.supervisor.step_lane(lane_a)
+        #
+        # Several cycles, not one. Each cycle takes a single sample and stores
+        # the evidence on the lane, because a multiplexing supervisor cannot sit
+        # inside a multi-poll wait without starving the other lane. Reaching
+        # "finished" therefore takes as many cycles as it takes to see streaming
+        # and then see idle hold.
+        for _ in range(5):
+            step_a3 = self.supervisor.step_lane(lane_a)
+            if step_a3["action"] == "WORKER_RESPONDED":
+                break
         self.assertEqual(step_a3["action"], "WORKER_RESPONDED")
         self.assertEqual(lane_a.record.work_state, "COLLECTING")
 

@@ -66,6 +66,13 @@ class LaneRecord:
     verify_token: str = ""
     source: str = "transcript"
     nonce: str = ""
+    # Completion evidence for the worker wait, carried between supervisor
+    # cycles. A multiplexing supervisor cannot block inside a multi-poll wait
+    # without starving every other lane, so the evidence that wait would have
+    # accumulated in memory has to live here instead -- which also means it
+    # survives a restart mid-wait.
+    saw_streaming: bool = False
+    idle_since: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

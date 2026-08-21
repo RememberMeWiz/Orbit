@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from ..bridge.accessibility import AccessibilityGuard
-from ..bridge.chatgpt import ChatGptAdapter
+from ..bridge.chatgpt import IDLE_CONFIRM_SECONDS, ChatGptAdapter
 from ..bridge.pm_envelope import PMDirective
 from ..bridge.registry import ChatEndpointRegistry
 from ..bridge.singlewriter import SingleWriterLock
@@ -355,12 +355,40 @@ class MultiWorkItemSupervisor:
             if not focused.ok:
                 return {"work_item": lane.work_item, "action": "WORKER_FOCUS_FAILED", "state": rec.work_state}
 
-            obs = self.adapter.wait_for_response(timeout=0.0)
-            if obs.state == "complete":
-                rec.work_state = STATE_COLLECTING
-                lane.save_record()
-                return {"work_item": lane.work_item, "action": "WORKER_RESPONDED", "state": rec.work_state}
-            return {"work_item": lane.work_item, "action": "AWAITING_WORKER_RESPONSE", "state": rec.work_state}
+            # One sample per cycle, with the evidence kept on the lane record.
+            #
+            # This was `wait_for_response(timeout=0.0)`, which cannot work: that
+            # routine concludes "complete" only after seeing streaming and then
+            # seeing idle persist, across several polls of its own. Given a zero
+            # timeout it returns on its first poll, before it can have seen
+            # anything, so it always reported `timeout` and the lane never
+            # advanced. Found by running the trial live; a stubbed adapter
+            # returns whatever the stub says and hides it completely.
+            #
+            # Blocking here instead would starve every other lane, which is the
+            # one thing a multiplexing supervisor must not do.
+            state = self.adapter.driver.response_state()
+            if not state.ok:
+                return {"work_item": lane.work_item, "action": "WORKER_STATE_UNREADABLE",
+                        "state": rec.work_state, "reason_code": state.reason_code}
+
+            observed = str(state.data.get("state", "unknown"))
+            now = self._clock()
+            if observed == "streaming":
+                rec.saw_streaming = True
+                rec.idle_since = ""
+            elif observed == "idle":
+                if not rec.idle_since:
+                    rec.idle_since = str(now)
+                elif rec.saw_streaming and (now - float(rec.idle_since)) >= IDLE_CONFIRM_SECONDS:
+                    rec.work_state = STATE_COLLECTING
+                    lane.save_record()
+                    return {"work_item": lane.work_item, "action": "WORKER_RESPONDED",
+                            "state": rec.work_state}
+            lane.save_record()
+            return {"work_item": lane.work_item, "action": "AWAITING_WORKER_RESPONSE",
+                    "state": rec.work_state, "observed": observed,
+                    "saw_streaming": rec.saw_streaming}
 
         # 5. COLLECTING -> Collect handoff
         if rec.work_state == STATE_COLLECTING:
