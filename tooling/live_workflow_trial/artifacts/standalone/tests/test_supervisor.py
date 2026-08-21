@@ -34,6 +34,83 @@ def _config_without(tmpdir, key):
     return target
 
 
+class ContentionTests(unittest.TestCase):
+    """Sharing one window must not mean lanes killing each other."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.adapter = MagicMock()
+        from standalone.operator.supervisor import MultiWorkItemSupervisor
+        self.sup = MultiWorkItemSupervisor(Path(self.tmp.name), adapter=self.adapter)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def lane(self, work_item="W-1"):
+        return self.sup.create_lane(work_item, "objective", expect=f"HANDOFF_{work_item}_A_TO_B.md",
+                                    token="TOK")
+
+    def wake_returns(self, reason):
+        from standalone.bridge.contracts import ChatTransportResult
+        self.adapter.deliver.return_value = ChatTransportResult.deny(
+            "SEND_BOUNDED_MESSAGE", reason, "")
+
+    def test_SUP_CONT_001_a_busy_window_is_not_a_dead_lane(self):
+        """Found live: lane B woke PM a second after lane A and was killed."""
+        lane = self.lane()
+        self.wake_returns("response-in-progress")
+        out = self.sup.step_lane(lane)
+        self.assertEqual(out["action"], "WAITING_FOR_TURN")
+        self.assertNotEqual(lane.record.work_state, STATE_BLOCKED)
+        self.assertEqual(lane.record.transient_count, 1)
+
+    def test_SUP_CONT_002_a_busy_ledger_is_not_a_dead_lane_either(self):
+        lane = self.lane()
+        self.wake_returns("writer-busy")
+        self.assertEqual(self.sup.step_lane(lane)["action"], "WAITING_FOR_TURN")
+
+    def test_SUP_CONT_003_a_real_failure_still_blocks_immediately(self):
+        lane = self.lane()
+        self.wake_returns("endpoint-not-registered")
+        out = self.sup.step_lane(lane)
+        self.assertEqual(out["action"], "WAKE_FAILED")
+        self.assertEqual(lane.record.work_state, STATE_BLOCKED)
+
+    def test_SUP_CONT_004_endless_contention_eventually_blocks(self):
+        """Retrying forever would hide a genuine stall."""
+        from standalone.operator.supervisor import MAX_CONSECUTIVE_TRANSIENT
+        lane = self.lane()
+        self.wake_returns("response-in-progress")
+        for _ in range(MAX_CONSECUTIVE_TRANSIENT):
+            out = self.sup.step_lane(lane)
+        self.assertEqual(lane.record.work_state, STATE_BLOCKED)
+        self.assertIn("consecutive attempts", lane.record.blocker_detail)
+
+    def test_SUP_CONT_005_progress_clears_the_contention_count(self):
+        """It counts contention, not lifetime."""
+        from standalone.bridge.contracts import ChatTransportResult
+        lane = self.lane()
+        self.wake_returns("response-in-progress")
+        self.sup.step_lane(lane)
+        self.sup.step_lane(lane)
+        self.assertEqual(lane.record.transient_count, 2)
+
+        self.adapter.deliver.return_value = ChatTransportResult.allow(
+            "SEND_BOUNDED_MESSAGE", {"request_id": "r1"}, delivery_state="SENT_UNCONFIRMED")
+        self.sup.step_lane(lane)
+        self.assertEqual(lane.record.transient_count, 0)
+
+    def test_SUP_CONT_006_contention_state_survives_a_restart(self):
+        lane = self.lane()
+        self.wake_returns("response-in-progress")
+        self.sup.step_lane(lane)
+        from standalone.operator.supervisor import MultiWorkItemSupervisor
+        resumed = MultiWorkItemSupervisor(Path(self.tmp.name), adapter=self.adapter)
+        again = resumed.get_lane("W-1")
+        again.load_record()
+        self.assertEqual(again.record.transient_count, 1)
+
+
 class ScopeSourceOfTruthTests(unittest.TestCase):
     """Scope must come from the committed config, never from a code default."""
 

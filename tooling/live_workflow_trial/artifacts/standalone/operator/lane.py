@@ -73,6 +73,9 @@ class LaneRecord:
     # survives a restart mid-wait.
     saw_streaming: bool = False
     idle_since: str = ""
+    # Consecutive cycles this lane has been unable to get the shared window.
+    # Reset by any real progress, so it counts contention rather than lifetime.
+    transient_count: int = 0
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

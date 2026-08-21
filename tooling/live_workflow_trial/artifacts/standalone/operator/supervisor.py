@@ -53,6 +53,32 @@ def load_orbit_config(config_path: Optional[Path] = None) -> Dict[str, Any]:
     return json.loads(target.read_text(encoding="utf-8"))
 
 
+# Failures that mean "not now", not "not ever".
+#
+# The window is a shared resource: only one conversation is visible, and only
+# one runner may transition the delivery ledger. So a lane routinely finds the
+# composer mid-stream from another lane's turn, or the ledger held by another
+# runner. Treating those as terminal means two lanes sharing one window kill
+# each other on contention, which is exactly what a multiplexing supervisor
+# exists to avoid.
+#
+# Found live: lane B woke PM one second after lane A did, hit
+# `response-in-progress`, and was marked BLOCKED forever.
+TRANSIENT_BLOCKERS = frozenset({
+    "response-in-progress",
+    "writer-busy",
+    "surface-not-ready-in-time",
+    "chat-list-not-ready-in-time",
+    "focus-verification-failed",
+    "composer-not-found",
+    "composer-not-present",
+})
+
+# A lane that cannot get the window after this many consecutive cycles is not
+# contending, it is stuck, and silently retrying forever would hide that.
+MAX_CONSECUTIVE_TRANSIENT = 40
+
+
 class MultiWorkItemSupervisor:
     """Supervises and multiplexes multiple independent work-item lanes."""
 
@@ -178,6 +204,36 @@ class MultiWorkItemSupervisor:
         outcome = guard.ensure(allow_launch=allow_launch)
         return outcome.to_dict()
 
+    def _note_failure(self, lane: "WorkItemLane", reason_code: str, detail: str,
+                      action: str, retry_state: str) -> Dict[str, Any]:
+        """Block on a real failure; wait and retry on contention.
+
+        The distinction is the whole point of multiplexing. A lane that finds
+        the window busy has not failed, it has simply not had its turn yet, and
+        blocking it there would mean the busier the system the more lanes die.
+        A lane that cannot get its turn for many consecutive cycles is a
+        different thing, and does block, so a genuine stall is still visible.
+        """
+        rec = lane.record
+        rec.blocker_code = reason_code
+        rec.blocker_detail = detail
+
+        if reason_code in TRANSIENT_BLOCKERS:
+            rec.transient_count += 1
+            if rec.transient_count < MAX_CONSECUTIVE_TRANSIENT:
+                rec.work_state = retry_state
+                lane.save_record()
+                return {"work_item": lane.work_item, "action": "WAITING_FOR_TURN",
+                        "state": rec.work_state, "reason_code": reason_code,
+                        "attempts": rec.transient_count}
+            detail = f"{detail} (after {rec.transient_count} consecutive attempts)".strip()
+            rec.blocker_detail = detail
+
+        rec.work_state = STATE_BLOCKED
+        lane.save_record()
+        return {"work_item": lane.work_item, "action": action, "state": rec.work_state,
+                "reason_code": reason_code}
+
     def step_lane(self, lane: WorkItemLane) -> Dict[str, Any]:
         """Execute one state step for an individual lane."""
         lane.load_record()
@@ -200,14 +256,12 @@ class MultiWorkItemSupervisor:
                 rec.pending_request_id = out.data.get("request_id", "")
                 rec.work_state = STATE_AWAITING_PM_ROUTING
                 rec.current_endpoint = "orbit-pm"
+                rec.transient_count = 0
                 lane.save_record()
                 return {"work_item": lane.work_item, "action": "PM_WOKEN", "state": rec.work_state}
             else:
-                rec.blocker_code = out.reason_code
-                rec.blocker_detail = out.detail
-                rec.work_state = STATE_BLOCKED
-                lane.save_record()
-                return {"work_item": lane.work_item, "action": "WAKE_FAILED", "state": rec.work_state}
+                return self._note_failure(lane, out.reason_code, out.detail,
+                                          "WAKE_FAILED", STATE_INITIALIZED)
 
         # 2. AWAITING_PM_ROUTING -> Poll PM for directive
         if rec.work_state == STATE_AWAITING_PM_ROUTING:
@@ -340,14 +394,12 @@ class MultiWorkItemSupervisor:
                     reason="pm-directed-dispatch",
                 )
                 rec.work_state = STATE_AWAITING_WORKER
+                rec.transient_count = 0
                 lane.save_record()
                 return {"work_item": lane.work_item, "action": "DISPATCHED", "state": rec.work_state}
             else:
-                rec.work_state = STATE_BLOCKED
-                rec.blocker_code = out.reason_code
-                rec.blocker_detail = out.detail
-                lane.save_record()
-                return {"work_item": lane.work_item, "action": "DISPATCH_FAILED", "state": rec.work_state}
+                return self._note_failure(lane, out.reason_code, out.detail,
+                                          "DISPATCH_FAILED", rec.work_state)
 
         # 4. AWAITING_WORKER -> Check response
         if rec.work_state == STATE_AWAITING_WORKER:
