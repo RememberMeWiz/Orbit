@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -35,16 +36,55 @@ from ..bridge.diagnostics import run as run_diagnostics
 from .insights import WorkflowInsightsAnalyzer
 from .overnight import OvernightRunner
 from .repl import OperatorRepl
+from .stateroot import describe, legacy_state_roots, resolve_state_root
 from .supervisor import MultiWorkItemSupervisor
 
 
 def default_state_dir() -> Path:
-    """Determine a durable default local state root."""
+    """Determine a durable default local state root.
+
+    Deliberately not under AppData. The Store build of Python virtualizes
+    %LOCALAPPDATA% and %APPDATA% into its own package LocalCache, so state
+    written there is invisible to any other Python and is destroyed by a Python
+    reset -- see `stateroot` for the measurements. ORBIT_STATE_DIR is still
+    honoured for compatibility with anything already setting it.
+    """
     if "ORBIT_STATE_DIR" in os.environ:
         return Path(os.environ["ORBIT_STATE_DIR"])
-    if sys.platform == "win32" and "LOCALAPPDATA" in os.environ:
-        return Path(os.environ["LOCALAPPDATA"]) / "Orbit" / "state"
-    return Path.home() / ".orbit" / "state"
+    return resolve_state_root().resolved
+
+
+def cmd_migrate_state(state_path: Path) -> int:
+    """Move lanes out of a virtualized legacy root into the real one.
+
+    Copy-then-verify rather than move: the legacy copy is left in place so a
+    failed migration cannot lose work, and a lane that already exists at the
+    destination is never overwritten -- the destination is authoritative once
+    anything has run against it.
+    """
+    root = resolve_state_root(state_path)
+    moved, skipped = [], []
+    for legacy in legacy_state_roots():
+        if legacy.resolve() == root.resolved:
+            continue
+        lanes_dir = legacy / "lanes"
+        if not lanes_dir.is_dir():
+            continue
+        for lane_dir in sorted(p for p in lanes_dir.iterdir() if p.is_dir()):
+            target = root.resolved / "lanes" / lane_dir.name
+            if target.exists():
+                skipped.append(lane_dir.name)
+                continue
+            shutil.copytree(lane_dir, target)
+            moved.append(lane_dir.name)
+
+    return emit_json({
+        "ok": True,
+        "state_root": root.to_dict(),
+        "migrated": moved,
+        "skipped_already_present": skipped,
+        "legacy_roots_left_in_place": [str(r) for r in legacy_state_roots()],
+    })
 
 
 def emit_json(payload: Dict[str, Any]) -> int:
@@ -124,6 +164,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     subparsers.add_parser("insights", help="Display workflow self-improvement proposals")
 
     # Doctor
+    subparsers.add_parser("migrate-state",
+                          help="Move lanes from a virtualized legacy state root into the real one")
     subparsers.add_parser("doctor", help="Check ChatGPT desktop accessibility and prerequisites")
 
     args = parser.parse_args(argv)
@@ -141,13 +183,24 @@ def main(argv: Optional[List[str]] = None) -> int:
         repl.run()
         return 0
 
+    if cmd == "migrate-state":
+        return cmd_migrate_state(state_path)
+
     if cmd == "status":
         summary = supervisor.status_summary()
         if args.json:
             return emit_json({"ok": True, **summary})
         surface = summary.get("surface", {})
         print("=== Orbit System Status ===")
-        print(f"State Root         : {state_path}")
+        # The *resolved* path, and loudly if it is not where it was asked for.
+        # A shadow location that reads back as the requested one is exactly how
+        # a supervisor and a CLI end up unable to see each other's lanes.
+        root = resolve_state_root(state_path)
+        print(f"State Root         : {describe(root)}")
+        legacy = [r for r in legacy_state_roots() if r.resolve() != root.resolved]
+        if legacy:
+            print(f"Legacy State Found : {', '.join(str(r) for r in legacy)}")
+            print(f"                     run 'orbit migrate-state' to move it here")
         print(f"Surface Status     : {surface.get('status', 'UNKNOWN')} (ok={surface.get('ok')}, drivable={surface.get('drivable')})")
         if surface.get("remedy"):
             print(f"Remedy             : {surface.get('remedy')}")

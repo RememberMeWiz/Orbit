@@ -173,6 +173,113 @@ class WorkerWaitTests(unittest.TestCase):
         self.assertEqual(out["action"], "WORKER_STATE_UNREADABLE")
 
 
+class LaneDiscoveryTests(unittest.TestCase):
+    """A supervisor that cannot see new work is not autonomous."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.adapter = MagicMock()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def supervisor(self):
+        from standalone.operator.supervisor import MultiWorkItemSupervisor
+        return MultiWorkItemSupervisor(self.root, adapter=self.adapter)
+
+    def names(self, sup):
+        return sorted(l.work_item for l in sup.list_lanes())
+
+    def test_SUP_DISC_001_a_lane_created_after_startup_is_discovered(self):
+        """The reported root cause: lanes registered by another process."""
+        running = self.supervisor()
+        self.assertEqual(self.names(running), [])
+
+        other_process = self.supervisor()
+        other_process.create_lane("W-A", "objective A", expect="HANDOFF_W-A_X_TO_ORBIT.md")
+
+        running.refresh_lanes()
+        self.assertEqual(self.names(running), ["W-A"])
+
+    def test_SUP_DISC_002_an_existing_lane_keeps_its_state_when_another_appears(self):
+        running = self.supervisor()
+        lane = running.create_lane("W-A", "objective A", expect="HANDOFF_W-A_X_TO_ORBIT.md")
+        lane.record.work_state = STATE_AWAITING_WORKER
+        lane.record.pending_request_id = "pmreq-keepme"
+        lane.save_record()
+
+        self.supervisor().create_lane("W-B", "objective B", expect="HANDOFF_W-B_X_TO_ORBIT.md")
+        running.refresh_lanes()
+
+        self.assertEqual(self.names(running), ["W-A", "W-B"])
+        kept = running.get_lane("W-A")
+        self.assertEqual(kept.record.work_state, STATE_AWAITING_WORKER)
+        self.assertEqual(kept.record.pending_request_id, "pmreq-keepme")
+
+    def test_SUP_DISC_003_a_malformed_lane_blocks_without_stopping_the_others(self):
+        running = self.supervisor()
+        running.create_lane("W-A", "objective A", expect="HANDOFF_W-A_X_TO_ORBIT.md")
+        bad = self.root / "lanes" / "W-BAD"
+        bad.mkdir(parents=True)
+        (bad / "lane.json").write_text("{ this is not json", encoding="utf-8")
+
+        running.refresh_lanes()
+        self.assertIn("W-BAD", running.malformed_lanes)
+        self.assertIn("W-A", self.names(running))
+
+    def test_SUP_DISC_004_a_malformed_lane_is_never_reinitialised(self):
+        """Rewriting a state file we failed to parse restarts in-flight work."""
+        running = self.supervisor()
+        bad = self.root / "lanes" / "W-BAD"
+        bad.mkdir(parents=True)
+        original = "{ this is not json"
+        (bad / "lane.json").write_text(original, encoding="utf-8")
+
+        running.refresh_lanes()
+        self.assertEqual((bad / "lane.json").read_text(encoding="utf-8"), original)
+
+    def test_SUP_DISC_005_identity_mismatch_is_refused(self):
+        running = self.supervisor()
+        lane = running.create_lane("W-A", "objective", expect="HANDOFF_W-A_X_TO_ORBIT.md")
+        record = json.loads((lane.lane_dir / "lane.json").read_text(encoding="utf-8"))
+        record["work_item"] = "W-SOMETHING-ELSE"
+        (lane.lane_dir / "lane.json").write_text(json.dumps(record), encoding="utf-8")
+
+        fresh = self.supervisor()
+        fresh.refresh_lanes()
+        self.assertIn("W-A", fresh.malformed_lanes)
+        self.assertIn("identity-mismatch", fresh.malformed_lanes["W-A"])
+
+    def test_SUP_DISC_006_a_vanished_directory_does_not_erase_known_work(self):
+        """An antivirus scan or half-written save must not delete a lane."""
+        import shutil
+        running = self.supervisor()
+        running.create_lane("W-A", "objective", expect="HANDOFF_W-A_X_TO_ORBIT.md")
+        running.refresh_lanes()
+        shutil.rmtree(self.root / "lanes" / "W-A")
+
+        running.refresh_lanes()
+        self.assertIn("W-A", self.names(running))
+        self.assertIn("W-A", running.vanished_lanes)
+
+    def test_SUP_DISC_007_restart_reconstructs_the_same_lane_set(self):
+        running = self.supervisor()
+        for name in ("W-A", "W-B", "W-C"):
+            running.create_lane(name, "objective", expect=f"HANDOFF_{name}_X_TO_ORBIT.md")
+
+        restarted = self.supervisor()
+        self.assertEqual(self.names(restarted), ["W-A", "W-B", "W-C"])
+
+    def test_SUP_DISC_008_status_and_cycle_see_the_same_inventory(self):
+        running = self.supervisor()
+        self.supervisor().create_lane("W-LATE", "objective", expect="HANDOFF_W-LATE_X_TO_ORBIT.md")
+
+        summary = running.status_summary()
+        self.assertIn("W-LATE", [l["work_item"] for l in summary["lanes"]])
+        self.assertIn("W-LATE", self.names(running))
+
+
 class ScopeSourceOfTruthTests(unittest.TestCase):
     """Scope must come from the committed config, never from a code default."""
 

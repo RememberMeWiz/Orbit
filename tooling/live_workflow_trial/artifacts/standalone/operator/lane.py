@@ -87,6 +87,14 @@ class LaneRecord:
         return cls(**filtered)
 
 
+class LaneRecordUnreadable(RuntimeError):
+    """A lane record exists but cannot be parsed.
+
+    Raised rather than repaired: rewriting state Orbit failed to understand is
+    how in-flight work gets silently restarted.
+    """
+
+
 class WorkItemLane:
     """Encapsulates durable execution state for a single independent work item."""
 
@@ -106,20 +114,42 @@ class WorkItemLane:
         self.record = self._load_or_create()
 
     def _load_or_create(self) -> LaneRecord:
+        """Load the record, or create one only when there is genuinely none.
+
+        An existing record that will not parse is raised, never replaced. The
+        previous behaviour caught the parse failure and wrote a blank record
+        over the top, which is far worse than losing the file: a lane whose
+        JSON was truncated by a crash mid-delivery came back as a brand new
+        INITIALIZED lane with no pending request and no accepted directive, so
+        the supervisor would wake PM and dispatch the same work a second time.
+        It also happened in the constructor, so merely looking at a lane
+        destroyed the evidence of what went wrong.
+        """
         if self.record_path.exists():
             try:
                 data = json.loads(self.record_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as exc:
+                raise LaneRecordUnreadable(
+                    f"{self.record_path}: {type(exc).__name__}: {exc}") from exc
+            try:
                 return LaneRecord.from_dict(data)
-            except Exception:
-                pass
+            except Exception as exc:
+                raise LaneRecordUnreadable(
+                    f"{self.record_path}: malformed record: {exc}") from exc
+
         rec = LaneRecord(work_item=self.work_item, objective="")
         self.save_record(rec)
         return rec
 
     def load_record(self) -> LaneRecord:
+        """Re-read from disk, which is the authority. Never repairs."""
         if self.record_path.exists():
-            data = json.loads(self.record_path.read_text(encoding="utf-8"))
-            self.record = LaneRecord.from_dict(data)
+            try:
+                data = json.loads(self.record_path.read_text(encoding="utf-8"))
+                self.record = LaneRecord.from_dict(data)
+            except (OSError, ValueError) as exc:
+                raise LaneRecordUnreadable(
+                    f"{self.record_path}: {type(exc).__name__}: {exc}") from exc
         return self.record
 
     def save_record(self, record: Optional[LaneRecord] = None) -> None:

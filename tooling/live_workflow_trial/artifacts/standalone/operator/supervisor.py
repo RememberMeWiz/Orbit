@@ -103,6 +103,12 @@ class MultiWorkItemSupervisor:
         self.driver_timeout = driver_timeout
         self._clock = clock
         self._sleep = sleeper
+        # Discovery bookkeeping, reported rather than kept private: an operator
+        # needs to see that a lane appeared, and that one is unreadable.
+        self.malformed_lanes: Dict[str, str] = {}
+        self.discovered_lanes: List[str] = []
+        self.vanished_lanes: List[str] = []
+        self.last_scan_error = ""
 
         # Scope comes from the committed configuration and from nowhere else.
         #
@@ -153,13 +159,79 @@ class MultiWorkItemSupervisor:
                 lane.resume()
 
     def load_lanes(self) -> Dict[str, WorkItemLane]:
+        """Full rescan, discarding what was held in memory.
+
+        Kept for startup. Everything running should call `refresh_lanes`, which
+        is additive and therefore safe to call in a loop.
+        """
         self._lanes.clear()
+        self.malformed_lanes = {}
+        return self.refresh_lanes()
+
+    def refresh_lanes(self) -> Dict[str, WorkItemLane]:
+        """Rescan the lanes directory, additively, every cycle.
+
+        The supervisor used to read the directory once at construction and then
+        iterate that snapshot forever, so a lane registered by any other process
+        after startup was invisible until someone restarted it. A process that is
+        alive but cannot see new work is not autonomous, so discovery is durable
+        and periodic rather than a one-time load.
+
+        Additive on purpose. A directory that is briefly unreadable -- an
+        antivirus scan, a half-written save, a sync client -- must not be able to
+        erase known work from a running supervisor, so lanes already in memory
+        are kept when they vanish from the scan and the disappearance is
+        recorded instead.
+
+        A lane that will not parse is held aside as malformed rather than
+        reinitialised, because rewriting a state file Orbit failed to understand
+        is how in-flight work gets silently restarted.
+        """
         if not self.lanes_dir.exists():
             return self._lanes
-        for entry in self.lanes_dir.iterdir():
-            if entry.is_dir():
+
+        try:
+            entries = sorted(e for e in self.lanes_dir.iterdir() if e.is_dir())
+        except OSError as exc:
+            self.last_scan_error = f"{type(exc).__name__}: {exc}"
+            return self._lanes
+        self.last_scan_error = ""
+
+        seen = set()
+        for entry in entries:
+            try:
                 lane = WorkItemLane(entry, global_stop_path=self.global_stop_path)
-                self._lanes[lane.work_item] = lane
+                lane.load_record()
+                # The record's own claim, compared against the directory that
+                # names it. The directory is what routing and the inbox use.
+                work_item = lane.record.work_item
+            except Exception as exc:
+                # One unreadable lane must not stop every healthy one.
+                self.malformed_lanes[entry.name] = f"{type(exc).__name__}: {exc}"
+                continue
+
+            if not work_item:
+                self.malformed_lanes[entry.name] = "lane-record-has-no-work-item"
+                continue
+            if work_item != entry.name:
+                # The directory name is the identity used for routing and for
+                # the inbox, so a record claiming a different one is ambiguous.
+                self.malformed_lanes[entry.name] = (
+                    f"lane-identity-mismatch: directory {entry.name}, record {work_item}")
+                continue
+
+            seen.add(work_item)
+            self.malformed_lanes.pop(entry.name, None)
+            existing = self._lanes.get(work_item)
+            if existing is None:
+                self._lanes[work_item] = lane
+                self.discovered_lanes.append(work_item)
+            else:
+                # Reload the authoritative record; another process may have
+                # advanced it, and disk is the authority.
+                existing.load_record()
+
+        self.vanished_lanes = sorted(set(self._lanes) - seen)
         return self._lanes
 
     def get_lane(self, work_item: str) -> Optional[WorkItemLane]:
@@ -501,7 +573,8 @@ class MultiWorkItemSupervisor:
         return {"work_item": lane.work_item, "action": "NO_OP", "state": rec.work_state}
 
     def cycle_all(self) -> List[Dict[str, Any]]:
-        """Run one pass across all active lanes."""
+        """Run one pass across all active lanes, rescanning first."""
+        self.refresh_lanes()
         results: List[Dict[str, Any]] = []
         for lane in self.list_lanes():
             if not lane.stopped() and not lane.paused():
@@ -510,7 +583,10 @@ class MultiWorkItemSupervisor:
         return results
 
     def status_summary(self) -> Dict[str, Any]:
-        self.load_lanes()
+        # refresh, not load: load clears memory first, which would let a
+        # momentarily unreadable directory erase lanes from a running
+        # supervisor. Status and cycle must see the same inventory.
+        self.refresh_lanes()
         surface = self.check_surface(allow_launch=False)
         lane_summaries = [l.summary_dict() for l in self.list_lanes()]
         active_count = sum(1 for l in lane_summaries if l["work_state"] not in (STATE_COMPLETED, STATE_BLOCKED, STATE_STOPPED, STATE_HOLD))
