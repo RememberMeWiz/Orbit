@@ -37,18 +37,81 @@ CHROME_ONLY_THRESHOLD = 50
 _PROBE_PS = r"""
 Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
+Add-Type @'
+using System;
+using System.Text;
+using System.Threading;
+using System.Runtime.InteropServices;
+public class OrbitProbeFinder {
+    [DllImport("user32.dll", SetLastError=true)]
+    public static extern IntPtr OpenInputDesktop(uint flags, bool inherit, uint access);
+    [DllImport("user32.dll", SetLastError=true)]
+    public static extern bool SetThreadDesktop(IntPtr hDesktop);
+    [DllImport("user32.dll", SetLastError=true)]
+    public static extern bool CloseDesktop(IntPtr h);
+    [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+    public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+    [DllImport("user32.dll")] public static extern int GetWindowThreadProcessId(IntPtr hWnd, out int processId);
+    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
+    [DllImport("user32.dll", CharSet=CharSet.Auto)] public static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
+    [DllImport("user32.dll", CharSet=CharSet.Auto)] public static extern int GetClassName(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
+
+    public static IntPtr FindChatHwnd(int[] targetPids) {
+        IntPtr result = IntPtr.Zero;
+        Thread worker = new Thread(() => {
+            IntPtr desk = OpenInputDesktop(0, false, 0x01ff);
+            if (desk != IntPtr.Zero) {
+                SetThreadDesktop(desk);
+                EnumWindows((hWnd, lParam) => {
+                    int pid = 0;
+                    GetWindowThreadProcessId(hWnd, out pid);
+                    for (int i = 0; i < targetPids.Length; i++) {
+                        if (targetPids[i] == pid) {
+                            StringBuilder cls = new StringBuilder(256);
+                            GetClassName(hWnd, cls, 256);
+                            StringBuilder title = new StringBuilder(256);
+                            GetWindowText(hWnd, title, 256);
+                            string c = cls.ToString();
+                            string t = title.ToString();
+                            if (c.Contains("Chrome_WidgetWin_1") && t.Equals("ChatGPT", StringComparison.OrdinalIgnoreCase)) {
+                                result = hWnd;
+                                return false;
+                            }
+                        }
+                    }
+                    return true;
+                }, IntPtr.Zero);
+                CloseDesktop(desk);
+            }
+        });
+        worker.SetApartmentState(ApartmentState.STA);
+        worker.Start();
+        worker.Join();
+        return result;
+    }
+}
+'@
 $ErrorActionPreference = "Stop"
 $out = @{}
-$p = Get-Process -Name "PROCESS_NAME" -ErrorAction SilentlyContinue |
-     Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1
-if (-not $p) {
+$procs = @(Get-Process -Name "PROCESS_NAME" -ErrorAction SilentlyContinue)
+$p = $procs | Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1
+$hwnd = [IntPtr]::Zero
+if ($p) {
+    $hwnd = $p.MainWindowHandle
+} elseif ($procs) {
+    $pids = [int[]]@($procs | ForEach-Object { $_.Id })
+    $hwnd = [OrbitProbeFinder]::FindChatHwnd($pids)
+    $p = $procs | Select-Object -First 1
+}
+
+if (-not $p -or $hwnd -eq [IntPtr]::Zero) {
   $out["app_running"] = $false
 } else {
   $out["app_running"] = $true
   $out["pid"] = $p.Id
   $out["window_title"] = $p.MainWindowTitle
   $out["executable"] = $p.Path
-  $root = [System.Windows.Automation.AutomationElement]::FromHandle($p.MainWindowHandle)
+  $root = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
   $out["class_name"] = $root.Current.ClassName
   $out["framework"] = $root.Current.FrameworkId
   $all = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants,

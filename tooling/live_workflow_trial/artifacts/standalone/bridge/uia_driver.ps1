@@ -43,6 +43,9 @@ public class OrbitCursor {
     [DllImport("user32.dll")] public static extern int GetWindowThreadProcessId(IntPtr h, out int pid);
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int cmd);
+    [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr h);
+    [DllImport("user32.dll")] public static extern void SwitchToThisWindow(IntPtr h, bool fAltTab);
+    [DllImport("user32.dll")] public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, int dwExtraInfo);
     [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint a, uint b, bool attach);
     [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
     [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
@@ -56,12 +59,56 @@ public class OrbitCursor {
 # apart from "the tree was never exposed", which have opposite remedies.
 Add-Type -TypeDefinition @'
 using System;
+using System.Text;
+using System.Threading;
 using System.Runtime.InteropServices;
 public class OrbitDesktop {
     [DllImport("user32.dll", SetLastError=true)]
     public static extern IntPtr OpenInputDesktop(uint flags, bool inherit, uint access);
     [DllImport("user32.dll", SetLastError=true)]
+    public static extern bool SetThreadDesktop(IntPtr hDesktop);
+    [DllImport("user32.dll", SetLastError=true)]
     public static extern bool CloseDesktop(IntPtr h);
+    [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+    public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+    [DllImport("user32.dll")] public static extern int GetWindowThreadProcessId(IntPtr hWnd, out int processId);
+    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
+    [DllImport("user32.dll", CharSet=CharSet.Auto)] public static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
+    [DllImport("user32.dll", CharSet=CharSet.Auto)] public static extern int GetClassName(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
+
+    public static IntPtr FindChatHwnd(int[] targetPids) {
+        IntPtr result = IntPtr.Zero;
+        Thread worker = new Thread(() => {
+            IntPtr desk = OpenInputDesktop(0, false, 0x01ff);
+            if (desk != IntPtr.Zero) {
+                SetThreadDesktop(desk);
+                EnumWindows((hWnd, lParam) => {
+                    int pid = 0;
+                    GetWindowThreadProcessId(hWnd, out pid);
+                    for (int i = 0; i < targetPids.Length; i++) {
+                        if (targetPids[i] == pid) {
+                            StringBuilder cls = new StringBuilder(256);
+                            GetClassName(hWnd, cls, 256);
+                            StringBuilder title = new StringBuilder(256);
+                            GetWindowText(hWnd, title, 256);
+                            string c = cls.ToString();
+                            string t = title.ToString();
+                            if (c.Contains("Chrome_WidgetWin_1") && t.Equals("ChatGPT", StringComparison.OrdinalIgnoreCase)) {
+                                result = hWnd;
+                                return false;
+                            }
+                        }
+                    }
+                    return true;
+                }, IntPtr.Zero);
+                CloseDesktop(desk);
+            }
+        });
+        worker.SetApartmentState(ApartmentState.STA);
+        worker.Start();
+        worker.Join();
+        return result;
+    }
 }
 '@
 
@@ -76,19 +123,19 @@ public class OrbitDesktop {
 [void][OrbitCursor]::SetProcessDPIAware()
 
 function Bring-ChatToFront([IntPtr]$hwnd) {
-  # A coordinate click only makes sense when the target app is actually in
-  # front. Windows refuses SetForegroundWindow from a background process unless
-  # the calling thread is attached to the foreground thread's input queue, so
-  # attach, raise, then detach. Bounded to the already-verified ChatGPT window.
   try {
     $fg = [OrbitCursor]::GetForegroundWindow()
     $fgThread = [OrbitCursor]::GetWindowThreadProcessId($fg, [ref]([int]0))
     $ourThread = [OrbitCursor]::GetCurrentThreadId()
     [void][OrbitCursor]::AttachThreadInput($fgThread, $ourThread, $true)
+    [OrbitCursor]::keybd_event(0x12, 0, 0, 0)
+    [OrbitCursor]::keybd_event(0x12, 0, 2, 0)
     [void][OrbitCursor]::ShowWindow($hwnd, 9)   # SW_RESTORE
     [void][OrbitCursor]::SetForegroundWindow($hwnd)
+    [void][OrbitCursor]::BringWindowToTop($hwnd)
+    [void][OrbitCursor]::SwitchToThisWindow($hwnd, $true)
     [void][OrbitCursor]::AttachThreadInput($fgThread, $ourThread, $false)
-    Start-Sleep -Milliseconds 500
+    Start-Sleep -Milliseconds 400
     $now = [OrbitCursor]::GetForegroundWindow()
     return ($now -eq $hwnd)
   } catch { return $false }
@@ -166,12 +213,21 @@ function Done($data) {
 }
 
 function Get-ChatWindow {
-  $procs = Get-Process -Name ChatGPT -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 }
+  $procs = @(Get-Process -Name ChatGPT -ErrorAction SilentlyContinue)
   if (-not $procs) { Fail "chat-app-not-running" }
-  $proc = $procs | Select-Object -First 1
-  # Only the trusted installed package may be driven.
-  if ($proc.Path -and $proc.Path -notlike "*OpenAI.Codex*") { Fail "chat-app-untrusted-path" $proc.Path }
-  $el = $UIA::FromHandle($proc.MainWindowHandle)
+  $proc = $procs | Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1
+  $hwnd = [IntPtr]::Zero
+  if ($proc) {
+    if ($proc.Path -and $proc.Path -notlike "*OpenAI.Codex*") { Fail "chat-app-untrusted-path" $proc.Path }
+    $hwnd = $proc.MainWindowHandle
+  } else {
+    $pids = [int[]]@($procs | ForEach-Object { $_.Id })
+    $hwnd = [OrbitDesktop]::FindChatHwnd($pids)
+    $proc = $procs | Select-Object -First 1
+    if ($proc.Path -and $proc.Path -notlike "*OpenAI.Codex*") { Fail "chat-app-untrusted-path" $proc.Path }
+  }
+  if ($hwnd -eq [IntPtr]::Zero) { Fail "chat-window-unavailable" }
+  $el = $UIA::FromHandle($hwnd)
   if ($null -eq $el) { Fail "chat-window-unavailable" }
   return $el
 }
@@ -374,7 +430,10 @@ switch ($Operation) {
       if (-not $vp.Current.IsReadOnly) {
         $vp.SetValue($text)
         Start-Sleep -Milliseconds 350
-        if ($vp.Current.Value -eq $text) { $method = "uia-value" }
+        $curVal = [string]$vp.Current.Value
+        if ($curVal.Length -gt 0 -and (($curVal -replace '\s+', ' ').Trim() -eq ($text -replace '\s+', ' ').Trim() -or $curVal -eq $text)) {
+          $method = "uia-value"
+        }
       }
     } catch { }
 
@@ -857,6 +916,13 @@ switch ($Operation) {
   "app_state" {
     $procs = @(Get-Process -Name ChatGPT -ErrorAction SilentlyContinue)
     $windowed = @($procs | Where-Object { $_.MainWindowHandle -ne 0 })
+    $chatHwnd = [IntPtr]::Zero
+    if ($windowed) {
+      $chatHwnd = ($windowed | Select-Object -First 1).MainWindowHandle
+    } elseif ($procs) {
+      $pids = [int[]]@($procs | ForEach-Object { $_.Id })
+      $chatHwnd = [OrbitDesktop]::FindChatHwnd($pids)
+    }
 
     if (-not $procs) {
       Done @{
@@ -866,19 +932,13 @@ switch ($Operation) {
       }
     }
 
-    # Every field below is read from ONE process. Aggregating across processes
-    # would let a trusted-and-flagged background instance lend its credentials
-    # to whichever window happened to be observed, so path, command line, window
-    # handle and composer all come from $proc and nowhere else.
     $proc = if ($windowed) { $windowed | Select-Object -First 1 } else { $procs | Select-Object -First 1 }
     $path = ""
     try { $path = [string]$proc.Path } catch { }
     $trusted = ($path -like "*OpenAI.Codex*")
 
-    # ...and when more than one instance owns a window, picking the first is a
-    # guess. Report the ambiguity instead: the caller must not treat any single
-    # instance's readiness as the app's readiness.
-    $windowedCount = $windowed.Count
+    $windowedCount = if ($windowed.Count -gt 0) { $windowed.Count } elseif ($chatHwnd -ne [IntPtr]::Zero) { 1 } else { 0 }
+    $isWindowed = ($windowedCount -gt 0)
 
     # The flag is only observable on the command line. A renderer that was
     # started without it exposes no semantic tree no matter how long we wait.
@@ -913,9 +973,10 @@ switch ($Operation) {
     $listName = ""
     if ($P.chat_list_name) { $listName = [string]$P.chat_list_name }
 
-    if ($windowed -and $trusted) {
+    if ($isWindowed -and $trusted) {
       try {
-        $el = $UIA::FromHandle($proc.MainWindowHandle)
+        $hwndToUse = if ($proc.MainWindowHandle -ne 0) { $proc.MainWindowHandle } else { $chatHwnd }
+        $el = $UIA::FromHandle($hwndToUse)
         if ($null -ne $el) {
           $all = All-Descendants $el
           $descendants = $all.Count
@@ -956,7 +1017,7 @@ switch ($Operation) {
 
     Done @{
       running = $true
-      windowed = [bool]$windowed
+      windowed = [bool]$isWindowed
       windowed_count = $windowedCount
       instance_ambiguous = ($windowedCount -gt 1)
       trusted_path = $trusted

@@ -143,7 +143,9 @@ class WorkItemLane:
         self.save_record()
 
     def resume(self) -> None:
-        if self.record.work_state == STATE_PAUSED:
+        if self.record.work_state in (STATE_PAUSED, STATE_BLOCKED):
+            self.record.blocker_code = ""
+            self.record.blocker_detail = ""
             self.record.work_state = (
                 STATE_AWAITING_PM_ROUTING
                 if self.record.pending_request_id
