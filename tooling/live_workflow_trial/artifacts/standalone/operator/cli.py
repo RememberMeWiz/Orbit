@@ -19,6 +19,8 @@ import argparse
 import json
 import os
 import shutil
+import subprocess
+import time
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -36,6 +38,7 @@ from ..bridge.diagnostics import run as run_diagnostics
 from .insights import WorkflowInsightsAnalyzer
 from .overnight import OvernightRunner
 from .repl import OperatorRepl
+from .lane import STATE_BLOCKED
 from .stateroot import describe, legacy_state_roots, resolve_state_root
 from .supervisor import MultiWorkItemSupervisor
 
@@ -85,6 +88,123 @@ def cmd_migrate_state(state_path: Path) -> int:
         "skipped_already_present": skipped,
         "legacy_roots_left_in_place": [str(r) for r in legacy_state_roots()],
     })
+
+
+def cmd_supervisor(state_path: Path, args) -> int:
+    """Bounded operator control over the supervisor process.
+
+    Four verbs and nothing resembling a shell. `ensure-running` is the one an
+    unattended setup calls: start when absent, refuse to add a second instance,
+    and restart only through a drain when the running process is stale or is
+    executing code the checkout no longer contains.
+    """
+    from .supervisor_process import (drain_path, read_heartbeat, request_drain,
+                                     supervisor_status)
+
+    repo_root = Path(__file__).resolve().parents[2]
+    root = resolve_state_root(state_path)
+    status = supervisor_status(root.resolved, repo_root)
+    action = args.action
+
+    if action == "status":
+        payload = {"ok": True, "state_root": root.to_dict(), **status,
+                   "heartbeat": read_heartbeat(root.resolved)}
+        if getattr(args, "json", False):
+            return emit_json(payload)
+        print("=== Orbit Supervisor ===")
+        print(f"State Root      : {describe(root)}")
+        print(f"Health          : {status.get('health')} ({status.get('reason_code')})")
+        print(f"Running         : {status.get('running')}")
+        print(f"PID             : {status.get('pid')}  created {status.get('process_creation_time') or '-'}")
+        age = status.get("heartbeat_age_seconds")
+        print(f"Heartbeat age   : {('%.0fs' % age) if age is not None else '-'}")
+        print(f"Running code    : {status.get('heartbeat_code_fingerprint') or '-'}")
+        print(f"Checkout code   : {status.get('current_code_fingerprint')}")
+        print(f"Branch / SHA    : {status.get('branch') or '-'} / {str(status.get('git_sha') or '-')[:12]}")
+        print(f"Lanes           : {status.get('lane_count')} total, "
+              f"{status.get('active_lane_count')} active, {status.get('blocked_lane_count')} blocked")
+        print(f"Last action     : {status.get('last_meaningful_action') or '-'}")
+        return 0
+
+    if action == "drain":
+        return emit_json({**request_drain(root.resolved), "previous_health": status.get("health")})
+
+    if action in ("ensure-running", "restart-safe"):
+        healthy = status.get("running") and status.get("health") in ("READY", "STARTING",
+                                                                    "WAITING_FOR_SURFACE")
+        if healthy and action == "ensure-running":
+            return emit_json({"ok": True, "action": "already-running", **status})
+
+        if status.get("running"):
+            # Never two supervisors on one state root, and never a hard kill
+            # while one might be mid-delivery: ask it to finish and exit.
+            request_drain(root.resolved,
+                          reason=f"{action}:{status.get('reason_code', '')}")
+            for _ in range(60):
+                time.sleep(1.0)
+                if not supervisor_status(root.resolved, repo_root).get("running"):
+                    break
+            else:
+                return emit_json({"ok": False, "action": "drain-timeout",
+                                  "reason_code": "supervisor-did-not-exit", **status})
+
+        started = _spawn_supervisor(repo_root, root.resolved, args)
+        return emit_json({"ok": started.get("ok", False), "action": "started", **started})
+
+    return emit_json({"ok": False, "reason_code": f"unknown-action:{action}"})
+
+
+def _spawn_supervisor(repo_root: Path, state_root: Path, args) -> Dict[str, Any]:
+    """Start exactly one supervisor, optionally in its own console window.
+
+    A visible window is worth having: an unattended operator that logs only to
+    a file is something you have to remember to go and read, and the point of
+    this process is that nobody is watching it.
+    """
+    from .supervisor_process import clear_drain
+
+    clear_drain(state_root)
+    cmd = [sys.executable, "-m", "standalone.operator.cli",
+           "--state-dir", str(state_root), "overnight",
+           "--interval", str(getattr(args, "interval", 15.0))]
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(repo_root) + os.pathsep + env.get("PYTHONPATH", "")
+    env["ORBIT_STATE_ROOT"] = str(state_root)
+
+    creation = 0
+    if sys.platform == "win32" and getattr(args, "window", False):
+        creation = subprocess.CREATE_NEW_CONSOLE
+    elif sys.platform == "win32":
+        creation = subprocess.CREATE_NO_WINDOW
+
+    try:
+        proc = subprocess.Popen(cmd, cwd=str(repo_root), env=env,
+                                creationflags=creation)
+    except OSError as exc:
+        return {"ok": False, "reason_code": f"spawn-failed:{exc}"}
+
+    # Give it long enough to write its first heartbeat, so "started" means
+    # started rather than "a process id was returned".
+    from .supervisor_process import supervisor_status
+    for _ in range(30):
+        time.sleep(1.0)
+        state = supervisor_status(state_root, repo_root)
+        if state.get("running"):
+            return {"ok": True, "pid": proc.pid, "windowed": bool(getattr(args, "window", False)),
+                    **state}
+    return {"ok": False, "pid": proc.pid, "reason_code": "no-heartbeat-after-start"}
+
+
+def supervisor_heartbeat_observed(state_path: Path) -> bool:
+    """Whether a live supervisor is actually watching this state root.
+
+    Registering a lane means nothing if nothing will ever step it, so the
+    result of `work` says so rather than leaving the operator to assume.
+    """
+    from .supervisor_process import supervisor_status
+    repo_root = Path(__file__).resolve().parents[2]
+    return bool(supervisor_status(resolve_state_root(state_path).resolved,
+                                  repo_root).get("running"))
 
 
 def emit_json(payload: Dict[str, Any]) -> int:
@@ -164,6 +284,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     subparsers.add_parser("insights", help="Display workflow self-improvement proposals")
 
     # Doctor
+    sup_parser = subparsers.add_parser("supervisor", help="Manage the always-on supervisor process")
+    sup_parser.add_argument("action",
+                            choices=("status", "ensure-running", "drain", "restart-safe"),
+                            help="status | ensure-running | drain | restart-safe")
+    sup_parser.add_argument("--window", action="store_true",
+                            help="run in its own console window so it can be watched")
+    sup_parser.add_argument("--interval", type=float, default=15.0)
+
     subparsers.add_parser("migrate-state",
                           help="Move lanes from a virtualized legacy state root into the real one")
     subparsers.add_parser("doctor", help="Check ChatGPT desktop accessibility and prerequisites")
@@ -182,6 +310,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         repl = OperatorRepl(supervisor)
         repl.run()
         return 0
+
+    if cmd == "supervisor":
+        return cmd_supervisor(state_path, args)
 
     if cmd == "migrate-state":
         return cmd_migrate_state(state_path)
@@ -232,20 +363,82 @@ def main(argv: Optional[List[str]] = None) -> int:
         objective = " ".join(args.objective)
         import time as _t
         work_item = args.work_item or f"WORK-{int(_t.time()) % 100000:05d}"
-        lane = supervisor.create_lane(
-            work_item,
-            objective,
-            assignment_path=args.assignment,
-            artifact_path=args.artifact,
-            expect=args.expect,
-            sender=args.sender,
-        )
-        print(f"Orbit: objective registered as '{work_item}'; requesting PM routing.")
+
+        # Refuse to reuse an identity. Two lanes under one work item share an
+        # inbox and a handoff filename, which the collector then refuses as
+        # ambiguous -- much later, and looking like a worker's fault.
+        supervisor.refresh_lanes()
+        if supervisor.get_lane(work_item) is not None:
+            return emit_json({
+                "ok": False, "result": "LANE_CREATION_FAILED",
+                "work_item": work_item, "lane_created": False,
+                "reason_code": "work-item-already-exists",
+            })
+
+        try:
+            lane = supervisor.create_lane(
+                work_item,
+                objective,
+                assignment_path=args.assignment,
+                artifact_path=args.artifact,
+                expect=args.expect,
+                sender=args.sender,
+            )
+        except Exception as exc:
+            return emit_json({
+                "ok": False, "result": "LANE_CREATION_FAILED",
+                "work_item": work_item, "lane_created": False,
+                "reason_code": f"{type(exc).__name__}: {exc}",
+            })
+
         step_res = supervisor.step_lane(lane)
+        lane.load_record()
+        action = step_res.get("action", "")
+
+        # What actually happened, rather than "the process exited 0".
+        #
+        # This printed the step action and returned 0 whatever it was, so an
+        # arms-only script recorded WAKE_FAILED, WAITING_FOR_TURN and PM_WOKEN
+        # as equally successful. Registration is not the same as having asked
+        # PM anything, and the difference is the whole point of the command.
+        pm_posted = bool(lane.record.pending_request_id) and action == "PM_WOKEN"
+        if action == "PM_WOKEN":
+            result, ok = "LANE_REGISTERED_AND_PM_WOKEN", True
+        elif action == "WAITING_FOR_TURN":
+            result, ok = "LANE_REGISTERED_PENDING_TURN", True
+        elif lane.record.work_state == STATE_BLOCKED:
+            result, ok = "LANE_REGISTERED_BUT_BLOCKED", False
+        else:
+            result, ok = "LANE_REGISTERED_PENDING_TURN", True
+
+        payload = {
+            "ok": ok,
+            "result": result,
+            "work_item": work_item,
+            "lane_created": True,
+            "work_state": lane.record.work_state,
+            "step_action": action,
+            "pending_request_id": lane.record.pending_request_id,
+            "pm_request_posted": pm_posted,
+            "reason_code": step_res.get("reason_code", "") or lane.record.blocker_code,
+            "supervisor_observed": supervisor_heartbeat_observed(state_path),
+            "expected_handoff": lane.record.expected_handoff,
+            "state_root": str(resolve_state_root(state_path).resolved),
+        }
         if args.json:
-            return emit_json({"ok": True, "work_item": work_item, "step": step_res})
-        print(f"Status: {step_res.get('action')} -> {step_res.get('state')}")
-        return 0
+            return emit_json(payload)
+
+        print(f"Orbit: objective registered as '{work_item}'.")
+        print(f"Result             : {result}")
+        print(f"PM request posted  : {pm_posted}"
+              + (f" ({lane.record.pending_request_id})" if pm_posted else ""))
+        print(f"Lane state         : {lane.record.work_state}")
+        if payload["reason_code"]:
+            print(f"Reason             : {payload['reason_code']}")
+        if not payload["supervisor_observed"]:
+            print("Supervisor         : NOT RUNNING — this lane will not advance "
+                  "until 'orbit supervisor ensure-running'")
+        return 0 if ok else 1
 
     if cmd == "overnight":
         runner = OvernightRunner(

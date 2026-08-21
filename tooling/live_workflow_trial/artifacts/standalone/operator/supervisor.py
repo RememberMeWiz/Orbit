@@ -24,6 +24,7 @@ from ..bridge.chatgpt import IDLE_CONFIRM_SECONDS, ChatGptAdapter
 from ..bridge.pm_envelope import PMDirective
 from ..bridge.registry import ChatEndpointRegistry
 from ..bridge.singlewriter import SingleWriterLock
+from .assignment import handoff_filename, render as render_assignment, sender_role_for
 from .lane import (
     STATE_AWAITING_PM_ROUTING,
     STATE_AWAITING_WORKER,
@@ -430,11 +431,28 @@ class MultiWorkItemSupervisor:
                 lane.save_record()
                 return {"work_item": lane.work_item, "action": "DISPATCH_BLOCKED", "state": rec.work_state}
 
-            assignment_text = (
-                Path(rec.assignment_path).read_text(encoding="utf-8")
-                if rec.assignment_path and Path(rec.assignment_path).is_file()
-                else f"Assignment for {rec.work_item}: {rec.objective}"
-            )
+            # The expected handoff name and the assignment must agree, and
+            # neither can be known until PM has chosen the endpoint -- the role
+            # that signs the handoff is the role PM routed to. So both are
+            # settled here, once, and the name is persisted so collection later
+            # looks for exactly what the worker was asked for.
+            sender_role = rec.expected_sender or sender_role_for(target_ep, self.adapter.registry)
+            if not rec.expected_handoff:
+                rec.expected_handoff = handoff_filename(lane.work_item, sender_role)
+                rec.expected_sender = sender_role
+                lane.save_record()
+
+            if rec.assignment_path and Path(rec.assignment_path).is_file():
+                assignment_text = Path(rec.assignment_path).read_text(encoding="utf-8")
+            else:
+                # Previously "Assignment for W: <objective>" -- a task with no
+                # reply contract at all, so the answer could never be collected
+                # and the lane blocked later looking like the worker's fault.
+                assignment_text = render_assignment(
+                    lane.work_item, rec.objective,
+                    sender_role=sender_role,
+                    token=rec.verify_token or lane.work_item,
+                )
             artifact_file = Path(rec.artifact_path) if rec.artifact_path and Path(rec.artifact_path).is_file() else None
 
             # Reconstruct directive object with exact preserved action

@@ -280,6 +280,41 @@ class LaneDiscoveryTests(unittest.TestCase):
         self.assertIn("W-LATE", self.names(running))
 
 
+class AssignmentContractTests(unittest.TestCase):
+    """A task without a reply contract cannot be collected."""
+
+    def test_SUP_ASG_001_the_assignment_states_how_to_answer(self):
+        from standalone.operator.assignment import render
+        text = render("W-1", "do the thing", sender_role="TL", token="TOK")
+        self.assertIn("ORBIT_HANDOFF_BEGIN HANDOFF_W-1_TL_TO_ORBIT.md", text)
+        for field in ("work_item:", "from:", "to:", "status:", "handoff_id:", "sequence:"):
+            self.assertIn(field, text)
+        self.assertIn("ORBIT_HANDOFF_END", text)
+        self.assertIn("do the thing", text)
+        self.assertIn("TOK", text)
+
+    def test_SUP_ASG_002_it_asks_for_text_not_a_file(self):
+        """Requesting a downloadable artifact triggers a paid work mode."""
+        from standalone.operator.assignment import render
+        text = render("W-1", "objective", sender_role="WORKER", token="TOK")
+        self.assertIn("Do not create or deliver any file", text)
+
+    def test_SUP_ASG_003_the_sender_role_comes_from_the_committed_registry(self):
+        from standalone.bridge.registry import ChatEndpointRegistry
+        from standalone.operator.assignment import sender_role_for
+        registry = ChatEndpointRegistry.from_orbit_config()
+        self.assertEqual(sender_role_for("architecture-tl", registry), "TL")
+        self.assertEqual(sender_role_for("windows-worker", registry), "WORKER")
+        self.assertEqual(sender_role_for("product-research", registry), "RESEARCH")
+
+    def test_SUP_ASG_004_the_expected_name_is_always_handoff_shaped(self):
+        """The old fallback produced HANDOFF_<work>.md, which cannot validate."""
+        from workflow.core.validation import NAME_RE
+        from standalone.operator.assignment import handoff_filename
+        for role in ("TL", "WORKER", "RESEARCH", "QA"):
+            self.assertIsNotNone(NAME_RE.match(handoff_filename("M0-X-001", role)), role)
+
+
 class ScopeSourceOfTruthTests(unittest.TestCase):
     """Scope must come from the committed config, never from a code default."""
 

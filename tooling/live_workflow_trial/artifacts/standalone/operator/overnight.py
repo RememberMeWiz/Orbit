@@ -16,6 +16,7 @@ Key behaviors:
 from __future__ import annotations
 
 import json
+import os
 import logging
 import signal
 import sys
@@ -27,6 +28,8 @@ from typing import Any, Callable, Dict, Optional
 
 from .lane import STATE_BLOCKED, STATE_COMPLETED, STATE_HOLD, STATE_STOPPED
 from .supervisor import MultiWorkItemSupervisor
+from .supervisor_process import (Heartbeat, clear_drain, code_fingerprint,
+                                 drain_requested, process_identity)
 
 
 def utc_now_iso() -> str:
@@ -56,6 +59,52 @@ class OvernightRunner:
         self.log_file = self.supervisor.state_dir / "overnight.log"
         self.events_file = self.supervisor.state_dir / "events.jsonl"
 
+    def _new_heartbeat(self) -> Heartbeat:
+        repo_root = Path(__file__).resolve().parents[2]
+        beat = Heartbeat(state_root=self.supervisor.state_dir, repo_root=repo_root)
+        beat.pid = os.getpid()
+        identity = process_identity(beat.pid) or {}
+        # Creation time as well as pid: Windows reuses process ids, so the pair
+        # is the identity and the id alone is a guess.
+        beat.process_creation_time = str(identity.get("created", ""))
+        beat.code_fingerprint = code_fingerprint(repo_root)
+        beat.branch, beat.git_sha = self._git_identity(repo_root)
+        beat.started_at = utc_now_iso()
+        beat.health = "STARTING"
+        return beat
+
+    @staticmethod
+    def _git_identity(repo_root: Path):
+        import subprocess
+        def run(*args):
+            try:
+                out = subprocess.run(["git", *args], cwd=str(repo_root),
+                                     capture_output=True, text=True, timeout=20)
+                return (out.stdout or "").strip()
+            except (OSError, subprocess.SubprocessError):
+                return ""
+        return run("rev-parse", "--abbrev-ref", "HEAD"), run("rev-parse", "HEAD")
+
+    def _record_cycle(self, cycle_results) -> None:
+        lanes = self.supervisor.list_lanes()
+        self._beat.lane_count = len(lanes)
+        self._beat.active_lane_count = sum(
+            1 for l in lanes if l.record.work_state not in
+            (STATE_COMPLETED, STATE_BLOCKED, STATE_STOPPED, STATE_HOLD))
+        self._beat.blocked_lane_count = sum(
+            1 for l in lanes if l.record.work_state == STATE_BLOCKED)
+        meaningful = [r for r in cycle_results
+                      if r.get("action") not in ("IDLE", "NO_OP", "AWAITING_WORKER_RESPONSE",
+                                                 "AWAITING_PM_DIRECTIVE", "WAITING_FOR_TURN")]
+        if meaningful:
+            latest = meaningful[-1]
+            self._beat.last_meaningful_action = (
+                f"{latest.get('work_item', '')}:{latest.get('action', '')}")
+            self._beat.current_lane = str(latest.get("work_item", ""))
+        self._beat.last_cycle_completed_at = utc_now_iso()
+        self._beat.health = "READY"
+        self._beat.write()
+
     def log_event(self, event_type: str, data: Dict[str, Any], level: str = "INFO") -> None:
         timestamp = utc_now_iso()
         entry = {"timestamp": timestamp, "type": event_type, "level": level, **data}
@@ -78,18 +127,22 @@ class OvernightRunner:
             "max_cycles": self.max_cycles,
         })
 
-        # Ensure surface is drivable
+        self._beat = self._new_heartbeat()
+        self._beat.write()
+
+        # A surface that is not ready yet is not a reason to give up.
+        #
+        # This used to return immediately, so starting Orbit while ChatGPT was
+        # still coming up -- or while it showed a sign-in screen -- exited the
+        # supervisor entirely and left every lane unattended until a human
+        # noticed. The whole point of unattended operation is surviving exactly
+        # that, so the surface is re-checked each cycle and the loop waits.
         surface = self.supervisor.check_surface(allow_launch=True)
         self.log_event("SURFACE_CHECK", surface)
         if not surface.get("drivable", False):
-            self.log_event("SURFACE_UNAVAILABLE", surface, level="ERROR")
-            self._running = False
-            return {
-                "ok": False,
-                "status": "SURFACE_UNAVAILABLE",
-                "surface": surface,
-                "cycles": 0,
-            }
+            self.log_event("SURFACE_UNAVAILABLE_WAITING", surface, level="WARNING")
+            self._beat.health = "WAITING_FOR_SURFACE"
+            self._beat.write()
 
         cycle_count = 0
         try:
@@ -98,7 +151,29 @@ class OvernightRunner:
                     self.log_event("OVERNIGHT_STOPPED", {"reason": "global-stop-active"})
                     break
 
+                # Supervisor-control drain, distinct from workflow STOP: asking
+                # this process to exit is not the same as halting all work, and
+                # conflating them makes restarting Orbit look like stopping it.
+                if drain_requested(self.supervisor.state_dir):
+                    self.log_event("OVERNIGHT_DRAINED", {"reason": "drain-requested"})
+                    self._beat.health = "DRAINED"
+                    self._beat.write()
+                    clear_drain(self.supervisor.state_dir)
+                    break
+
                 cycle_count += 1
+                self._beat.last_cycle_started_at = utc_now_iso()
+                self._beat.write()
+
+                # Re-checked every cycle, not only at startup.
+                surface = self.supervisor.check_surface(allow_launch=True)
+                if not surface.get("drivable", False):
+                    self._beat.health = "WAITING_FOR_SURFACE"
+                    self._beat.write()
+                    self.log_event("SURFACE_UNAVAILABLE_WAITING", surface, level="WARNING")
+                    self._sleep(self.poll_interval)
+                    continue
+                self._beat.last_successful_surface_check = utc_now_iso()
                 lanes = self.supervisor.list_lanes()
                 active_lanes = [l for l in lanes if not l.stopped() and not l.paused() and l.record.work_state not in (STATE_COMPLETED, STATE_BLOCKED, STATE_HOLD)]
 
@@ -113,6 +188,8 @@ class OvernightRunner:
                     if curr_state != prev_state or res.get("action") not in ("NO_OP", "IDLE"):
                         self._last_state_snapshot[w_item] = curr_state
                         self.log_event("LANE_TRANSITION", res)
+
+                self._record_cycle(cycle_results)
 
                 if self.max_cycles is not None and cycle_count >= self.max_cycles:
                     self.log_event("MAX_CYCLES_REACHED", {"cycles": cycle_count})
