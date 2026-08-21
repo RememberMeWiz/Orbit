@@ -23,6 +23,45 @@ from standalone.operator.lane import (
 from standalone.operator.supervisor import MultiWorkItemSupervisor, load_orbit_config
 
 
+def _config_without(tmpdir, key):
+    """A committed config with one scope key removed."""
+    import json, pathlib
+    from standalone.operator.supervisor import DEFAULT_CONFIG_PATH
+    raw = json.loads(pathlib.Path(DEFAULT_CONFIG_PATH).read_text(encoding="utf-8"))
+    raw.pop(key, None)
+    target = pathlib.Path(tmpdir) / "endpoints.json"
+    target.write_text(json.dumps(raw), encoding="utf-8")
+    return target
+
+
+class ScopeSourceOfTruthTests(unittest.TestCase):
+    """Scope must come from the committed config, never from a code default."""
+
+    def test_SUP_SCOPE_001_runtime_scope_matches_the_committed_config(self):
+        import json, pathlib, tempfile
+        from standalone.operator.supervisor import DEFAULT_CONFIG_PATH, MultiWorkItemSupervisor
+
+        committed = json.loads(pathlib.Path(DEFAULT_CONFIG_PATH).read_text(encoding="utf-8"))
+        with tempfile.TemporaryDirectory() as tmp:
+            sup = MultiWorkItemSupervisor(pathlib.Path(tmp), adapter=MagicMock())
+            self.assertEqual(sup.workflow_scope, committed["workflow_scope"])
+            self.assertEqual(sup.project_scope, committed["project_scope"])
+            self.assertEqual(sup.chat_list_name, committed["chat_list_name"])
+
+    def test_SUP_SCOPE_002_a_missing_scope_key_fails_closed(self):
+        """A code default would keep working while sourcing a second truth."""
+        import tempfile, pathlib
+        from standalone.operator.supervisor import MultiWorkItemSupervisor
+
+        for key in ("project_scope", "workflow_scope", "chat_list_name"):
+            with tempfile.TemporaryDirectory() as tmp:
+                config = _config_without(tmp, key)
+                with self.assertRaises(ValueError) as ctx:
+                    MultiWorkItemSupervisor(pathlib.Path(tmp) / "state",
+                                            adapter=MagicMock(), config_path=config)
+                self.assertIn(key, str(ctx.exception))
+
+
 class TestMultiWorkItemSupervisor(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

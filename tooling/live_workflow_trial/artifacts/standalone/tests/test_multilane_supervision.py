@@ -1,16 +1,23 @@
-"""Live trial verification for Multi-Lane Supervisor (M0-WF-OVERNIGHT-OPERATOR-001).
+"""Multi-lane supervision logic, against a stubbed adapter.
 
-Proves:
-1. Both lanes (WORK-A and WORK-B) exist independently.
-2. PM request IDs do not cross.
-3. Directives do not cross.
-4. One lane can wait while the other advances.
-5. One lane blocking (or HOLD/STOP) does not freeze the other.
-6. Orbit switches chats semantically (via adapter focus).
-7. Both returned handoffs remain work-item bound.
-8. No human chat switching.
-9. No manual file courier.
-10. No duplicate Send actuation (SingleWriterLock).
+This file was previously named `test_live_multilane_trial.py` and its docstring
+claimed to be a live trial. It is not one and never was: the adapter is a
+`MagicMock`, so nothing here touches ChatGPT Desktop, switches a real chat, or
+presses a real Send. Renamed because a test that claims live proof while mocking
+the whole surface is worse than no test — it lets the box be ticked.
+
+What it does prove, which is worth proving, is the supervisor's *decisions*:
+
+1. Two lanes exist independently, in separate directories.
+2. PM request IDs do not cross between lanes.
+3. A directive for one work item is refused by the other.
+4. One lane on HOLD does not freeze the other.
+5. Chat switching goes through `adapter.focus()` rather than anything positional.
+6. Returned handoffs stay bound to their own work item.
+7. No duplicate Send actuation, via SingleWriterLock.
+
+Live two-lane proof is a separate artifact under `longrun/evidence/`, because
+PM's requirement was explicit: unit test green is not live proven.
 """
 import hashlib
 import json

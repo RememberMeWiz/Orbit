@@ -78,10 +78,23 @@ class MultiWorkItemSupervisor:
         self._clock = clock
         self._sleep = sleeper
 
-        # Configured scope parameters directly from committed configuration
-        self.project_scope = str(self.config.get("project_scope", "Orbit"))
-        self.workflow_scope = str(self.config.get("workflow_scope", "orbit-m0-live-trial"))
-        self.chat_list_name = str(self.config.get("chat_list_name", "Chats in Yong 2"))
+        # Scope comes from the committed configuration and from nowhere else.
+        #
+        # These were `.get(key, "literal")` defaults. The defaults happened to
+        # match the committed values, which is exactly what makes that shape
+        # dangerous: a config that lost a key would keep working while silently
+        # sourcing scope from a second copy of the truth, and the drift would
+        # only surface as an endpoint refusing to resolve much later. A missing
+        # key is a broken config, so it fails here instead.
+        missing = [key for key in ("project_scope", "workflow_scope", "chat_list_name")
+                   if not str(self.config.get(key, "")).strip()]
+        if missing:
+            raise ValueError(
+                f"Orbit endpoint config {self.config_path} is missing required scope "
+                f"{', '.join(missing)}; scope must not be defaulted in code")
+        self.project_scope = str(self.config["project_scope"])
+        self.workflow_scope = str(self.config["workflow_scope"])
+        self.chat_list_name = str(self.config["chat_list_name"])
 
         if adapter is not None:
             self.adapter = adapter
