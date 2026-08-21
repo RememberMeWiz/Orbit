@@ -5,12 +5,12 @@
 
 | Field | Value |
 | :--- | :--- |
-| Updated | 2026-08-21T18:05Z |
+| Updated | 2026-08-21T23:30Z |
 | Branch | `claude/m0-operator-reconcile-001` (from `antigravity/m0-overnight-operator-001`) |
 | Started from | `446e43af18445067a9bc227bb810ce17069929cf` (head of `claude/m0-wf-apprentice-002`) |
-| HEAD | `a1a4c54` |
+| HEAD | `c1f0214` |
 | Current phase | **Workflow-first mainline** (per 05:11 resume briefing) |
-| Current objective | operator UX + overnight, then Steward transport |
+| Current objective | M0-WF-AUTONOMY-RECOVERY-001 - supervisor live and advancing |
 | Blocker | NONE |
 
 ---
@@ -152,10 +152,10 @@ for supervised runs.
 
 ```text
 workflow     67 pass
-standalone  403 pass   (2 skipped: symlink creation needs Developer Mode;
+standalone  415 pass   (2 skipped: symlink creation needs Developer Mode;
                         Windows junction coverage supersedes them)
 native       14 pass
-TOTAL       484 pass, 2 skipped, 0 release-blocking skips
+TOTAL       496 pass, 2 skipped, 0 release-blocking skips
 ```
 
 ---
@@ -338,6 +338,57 @@ keystroke removed (injected precisely when the target is not in front, which is
 the invariant the driver holds), and window trust re-checked against the process
 that actually owns the discovered window rather than whichever was enumerated
 first.
+
+### Autonomy recovery - supervisor live and advancing
+
+The stalled supervisor had **three** causes, not the one reported.
+
+**Durable state was inside a virtualized package cache** (`42433fd`). Orbit runs
+under the Store build of Python, which redirects `%LOCALAPPDATA%` and `%APPDATA%`
+into its own LocalCache:
+
+```text
+LOCALAPPDATA  C:\Users\louis\AppData\Local
+              -> ...\Packages\PythonSoftwareFoundation.Python.3.12_...\LocalCache\Local
+USERPROFILE   C:\Users\louis   -> itself
+```
+
+Every lane lived where no other Python could see it, so two processes agreeing on
+the same configured path still could not see each other's work - and unlike an
+in-memory cache, restarting does not fix that. State now defaults under
+`%USERPROFILE%`, redirection is detected and reported rather than tolerated, and
+`orbit migrate-state` moved the four lanes. They are visible from outside Python
+for the first time.
+
+**The supervisor could not discover lanes created after startup** - the reported
+cause. It read the directory once at construction. Discovery is now a durable
+rescan every cycle, additive, so a briefly unreadable directory cannot erase
+known work from a running supervisor.
+
+**A malformed lane record was silently reinitialised.** An unparseable record was
+overwritten with a blank one, in the constructor. Far worse than losing the file:
+a lane whose JSON was truncated mid-delivery came back as a fresh INITIALIZED
+lane and would wake PM and dispatch the same work again. Now preserved and held
+aside as malformed while every other lane keeps moving.
+
+Also fixed on the way (`9bd25a8`): `orbit work` reported success on any outcome
+including `WAKE_FAILED`; the dispatched assignment carried no reply contract at
+all; the expected handoff name fell back to a form that cannot validate; and the
+overnight runner exited outright whenever the surface was not ready.
+
+### Live evidence - three lanes advancing unattended
+
+```text
+ARCH  PM_WOKEN -> DIRECTIVE_ACCEPTED -> DISPATCHED  (architecture-tl)
+COST  PM_WOKEN -> DIRECTIVE_ACCEPTED               (product-research)
+OPS   PM_WOKEN
+```
+
+Both routed directives matched the preauthorized table exactly, arriving through
+the normal governed envelope with nothing injected. The supervisor runs in its
+own console window; its heartbeat records pid, process creation time and a code
+fingerprint, so a process running stale code reports OUTDATED rather than being
+assumed current.
 
 ## Defects found live, all fixed
 
