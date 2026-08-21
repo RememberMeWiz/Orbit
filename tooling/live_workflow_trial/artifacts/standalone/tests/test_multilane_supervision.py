@@ -55,24 +55,15 @@ class MultiLaneSupervisionTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def _drive_worker_to_idle(self, lane=None):
-        """Streaming, then idle long enough to count as finished."""
-        from standalone.bridge.chatgpt import IDLE_CONFIRM_SECONDS
+        """An idle window, which is what a finished worker looks like.
 
-        states = ["streaming", "idle", "idle"]
-        clock = {"t": 0.0}
-
-        def next_state():
-            value = states.pop(0) if len(states) > 1 else states[0]
-            return MagicMock(ok=True, data={"state": value},
-                             reason_code="ok")
-
-        self.mock_adapter.driver.response_state.side_effect = lambda: next_state()
-
-        def advancing_clock():
-            clock["t"] += IDLE_CONFIRM_SECONDS
-            return clock["t"]
-
-        self.supervisor._clock = advancing_clock
+        Deliberately not "streaming then idle". The supervisor no longer waits
+        to witness streaming, because it samples every ~30s while sharing the
+        window and a worker that answers quickly finishes entirely between two
+        samples. Idle simply means "ask whether the handoff is there yet".
+        """
+        self.adapter_state = MagicMock(ok=True, data={"state": "idle"}, reason_code="ok")
+        self.mock_adapter.driver.response_state.return_value = self.adapter_state
 
     def test_live_two_lane_independent_multiplexing(self):
         # 1. Register two independent work items targeting distinct registered endpoints
@@ -205,16 +196,11 @@ class MultiLaneSupervisionTests(unittest.TestCase):
 
         # Step Lane A: AWAITING_WORKER -> COLLECTING
         #
-        # Several cycles, not one. Each cycle takes a single sample and stores
-        # the evidence on the lane, because a multiplexing supervisor cannot sit
-        # inside a multi-poll wait without starving the other lane. Reaching
-        # "finished" therefore takes as many cycles as it takes to see streaming
-        # and then see idle hold.
-        for _ in range(5):
-            step_a3 = self.supervisor.step_lane(lane_a)
-            if step_a3["action"] == "WORKER_RESPONDED":
-                break
-        self.assertEqual(step_a3["action"], "WORKER_RESPONDED")
+        # An idle window means "try collecting", not "the worker is idle so it
+        # never started". Whether it finished is answered by the handoff being
+        # there, which cannot be missed the way a streaming phase can.
+        step_a3 = self.supervisor.step_lane(lane_a)
+        self.assertEqual(step_a3["action"], "WORKER_IDLE_TRY_COLLECT")
         self.assertEqual(lane_a.record.work_state, "COLLECTING")
 
         # Step Lane A: COLLECTING -> REPORTING_TO_PM

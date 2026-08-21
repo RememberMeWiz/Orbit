@@ -11,6 +11,7 @@ from standalone.operator.lane import (
     STATE_AWAITING_PM_ROUTING,
     STATE_AWAITING_WORKER,
     STATE_BLOCKED,
+    STATE_COLLECTING,
     STATE_COMPLETED,
     STATE_DIRECTIVE_ACCEPTED,
     STATE_HOLD,
@@ -109,6 +110,67 @@ class ContentionTests(unittest.TestCase):
         again = resumed.get_lane("W-1")
         again.load_record()
         self.assertEqual(again.record.transient_count, 1)
+
+
+class WorkerWaitTests(unittest.TestCase):
+    """Waiting must survive missing the moment the worker replied."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.adapter = MagicMock()
+        from standalone.operator.supervisor import MultiWorkItemSupervisor
+        self.sup = MultiWorkItemSupervisor(Path(self.tmp.name), adapter=self.adapter)
+        self.lane = self.sup.create_lane("W-1", "objective",
+                                         expect="HANDOFF_W-1_A_TO_B.md", token="TOK")
+        self.lane.record.work_state = STATE_AWAITING_WORKER
+        self.lane.record.current_endpoint = "windows-worker"
+        self.lane.save_record()
+        self.adapter.focus.return_value = MagicMock(ok=True)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def observe(self, state):
+        self.adapter.driver.response_state.return_value = MagicMock(
+            ok=True, data={"state": state}, reason_code="ok")
+
+    def test_SUP_WAIT_001_an_idle_window_is_checked_for_the_handoff(self):
+        """Streaming may have finished entirely between two samples."""
+        self.observe("idle")
+        out = self.sup.step_lane(self.lane)
+        self.assertEqual(out["action"], "WORKER_IDLE_TRY_COLLECT")
+        self.assertEqual(self.lane.record.work_state, STATE_COLLECTING)
+
+    def test_SUP_WAIT_002_completion_never_depends_on_witnessing_streaming(self):
+        """The defect: saw_streaming stayed false and the lane waited forever."""
+        self.observe("idle")
+        self.sup.step_lane(self.lane)
+        self.assertFalse(self.lane.record.saw_streaming)
+        self.assertEqual(self.lane.record.work_state, STATE_COLLECTING)
+
+    def test_SUP_WAIT_003_a_streaming_window_is_left_alone(self):
+        self.observe("streaming")
+        out = self.sup.step_lane(self.lane)
+        self.assertEqual(out["action"], "AWAITING_WORKER_RESPONSE")
+        self.assertEqual(self.lane.record.work_state, STATE_AWAITING_WORKER)
+
+    def test_SUP_WAIT_004_no_handoff_yet_returns_to_waiting(self):
+        """Not finished writing is not a failure."""
+        from standalone.bridge.contracts import ChatTransportResult
+        self.lane.record.work_state = STATE_COLLECTING
+        self.lane.save_record()
+        self.adapter.collect_from_transcript.return_value = ChatTransportResult.deny(
+            "COLLECT_EXPECTED_ARTIFACT", "transcript-handoff-not-found", "")
+        out = self.sup.step_lane(self.lane)
+        self.assertEqual(out["action"], "AWAITING_WORKER_RESPONSE")
+        self.assertEqual(self.lane.record.work_state, STATE_AWAITING_WORKER)
+        self.assertNotEqual(self.lane.record.work_state, STATE_BLOCKED)
+
+    def test_SUP_WAIT_005_an_unreadable_window_is_reported_not_guessed(self):
+        self.adapter.driver.response_state.return_value = MagicMock(
+            ok=False, reason_code="chat-window-unavailable", data={})
+        out = self.sup.step_lane(self.lane)
+        self.assertEqual(out["action"], "WORKER_STATE_UNREADABLE")
 
 
 class ScopeSourceOfTruthTests(unittest.TestCase):

@@ -407,40 +407,36 @@ class MultiWorkItemSupervisor:
             if not focused.ok:
                 return {"work_item": lane.work_item, "action": "WORKER_FOCUS_FAILED", "state": rec.work_state}
 
-            # One sample per cycle, with the evidence kept on the lane record.
+            # Is the answer there yet? -- not -- did I witness it arriving?
             #
-            # This was `wait_for_response(timeout=0.0)`, which cannot work: that
-            # routine concludes "complete" only after seeing streaming and then
-            # seeing idle persist, across several polls of its own. Given a zero
-            # timeout it returns on its first poll, before it can have seen
-            # anything, so it always reported `timeout` and the lane never
-            # advanced. Found by running the trial live; a stubbed adapter
-            # returns whatever the stub says and hides it completely.
+            # This required seeing streaming and then seeing idle hold. That is
+            # edge-triggered, and the supervisor samples every ~30s because it
+            # is sharing the window between lanes, so a worker that answers in
+            # twenty seconds finishes entirely between two samples. Observed
+            # live: both lanes sat with saw_streaming=false and observed=idle
+            # forever, waiting for a phase that had already been and gone.
             #
-            # Blocking here instead would starve every other lane, which is the
-            # one thing a multiplexing supervisor must not do.
+            # So the wait is level-triggered on the thing actually wanted. Idle
+            # means "try collecting"; the handoff is either in the transcript or
+            # it is not. A partially written answer cannot be mistaken for a
+            # finished one because collection requires the closing marker, so a
+            # half-streamed block is simply not found yet.
             state = self.adapter.driver.response_state()
             if not state.ok:
                 return {"work_item": lane.work_item, "action": "WORKER_STATE_UNREADABLE",
                         "state": rec.work_state, "reason_code": state.reason_code}
 
             observed = str(state.data.get("state", "unknown"))
-            now = self._clock()
             if observed == "streaming":
                 rec.saw_streaming = True
-                rec.idle_since = ""
-            elif observed == "idle":
-                if not rec.idle_since:
-                    rec.idle_since = str(now)
-                elif rec.saw_streaming and (now - float(rec.idle_since)) >= IDLE_CONFIRM_SECONDS:
-                    rec.work_state = STATE_COLLECTING
-                    lane.save_record()
-                    return {"work_item": lane.work_item, "action": "WORKER_RESPONDED",
-                            "state": rec.work_state}
+                lane.save_record()
+                return {"work_item": lane.work_item, "action": "AWAITING_WORKER_RESPONSE",
+                        "state": rec.work_state, "observed": observed}
+
+            rec.work_state = STATE_COLLECTING
             lane.save_record()
-            return {"work_item": lane.work_item, "action": "AWAITING_WORKER_RESPONSE",
-                    "state": rec.work_state, "observed": observed,
-                    "saw_streaming": rec.saw_streaming}
+            return {"work_item": lane.work_item, "action": "WORKER_IDLE_TRY_COLLECT",
+                    "state": rec.work_state, "observed": observed}
 
         # 5. COLLECTING -> Collect handoff
         if rec.work_state == STATE_COLLECTING:
@@ -456,6 +452,14 @@ class MultiWorkItemSupervisor:
                 rec.work_state = STATE_REPORTING_TO_PM
                 lane.save_record()
                 return {"work_item": lane.work_item, "action": "COLLECTED", "state": rec.work_state}
+            elif out.reason_code in ("transcript-handoff-not-found",
+                                     "artifact-not-present"):
+                # Not a failure: the worker has not finished writing. Back to
+                # waiting, and the next cycle asks again.
+                rec.work_state = STATE_AWAITING_WORKER
+                lane.save_record()
+                return {"work_item": lane.work_item, "action": "AWAITING_WORKER_RESPONSE",
+                        "state": rec.work_state, "reason_code": out.reason_code}
             else:
                 rec.work_state = STATE_BLOCKED
                 rec.blocker_code = out.reason_code
