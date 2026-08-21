@@ -166,7 +166,7 @@ def _spawn_supervisor(repo_root: Path, state_root: Path, args) -> Dict[str, Any]
     clear_drain(state_root)
     cmd = [sys.executable, "-m", "standalone.operator.cli",
            "--state-dir", str(state_root), "overnight",
-           "--interval", str(getattr(args, "interval", 15.0))]
+           "--poll-interval", str(getattr(args, "interval", 15.0))]
     env = dict(os.environ)
     env["PYTHONPATH"] = str(repo_root) + os.pathsep + env.get("PYTHONPATH", "")
     env["ORBIT_STATE_ROOT"] = str(state_root)
