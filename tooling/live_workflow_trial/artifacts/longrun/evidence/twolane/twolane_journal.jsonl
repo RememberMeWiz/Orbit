@@ -1,0 +1,28 @@
+{"at": "2026-08-21T12:36:21", "drivable": true, "event": "preflight", "status": "READY"}
+{"at": "2026-08-21T12:36:21", "dir": "C:\\Users\\louis\\AppData\\Local\\Temp\\claude\\E--Users-Louis-Documents-Orbit\\3b6b4c7d-9fd1-4679-95ea-c3b88dfcc1ea\\scratchpad\\twolane\\lanes\\M0-LANE-A-123619", "event": "lane_created", "expect": "HANDOFF_M0-LANE-A-123619_WORKER_TO_ORBIT.md", "work_item": "M0-LANE-A-123619"}
+{"at": "2026-08-21T12:36:21", "dir": "C:\\Users\\louis\\AppData\\Local\\Temp\\claude\\E--Users-Louis-Documents-Orbit\\3b6b4c7d-9fd1-4679-95ea-c3b88dfcc1ea\\scratchpad\\twolane\\lanes\\M0-LANE-B-123619", "event": "lane_created", "expect": "HANDOFF_M0-LANE-B-123619_ARCHITECTURE_TO_ORBIT.md", "work_item": "M0-LANE-B-123619"}
+{"at": "2026-08-21T12:36:49", "endpoint": "orbit-pm", "event": "send", "ok": true, "reason": "ok", "total_sends": 1}
+{"action": "PM_WOKEN", "at": "2026-08-21T12:37:03", "event": "step", "round": 1, "state": "AWAITING_PM_ROUTING", "work_item": "M0-LANE-A-123619"}
+{"action": "WAITING_FOR_TURN", "at": "2026-08-21T12:37:03", "attempts": 1, "event": "step", "reason_code": "response-in-progress", "round": 1, "state": "INITIALIZED", "work_item": "M0-LANE-B-123619"}
+{"at": "2026-08-21T12:37:47", "endpoint": "orbit-pm", "event": "send", "ok": true, "reason": "ok", "total_sends": 2}
+{"action": "DIRECTIVE_ACCEPTED", "at": "2026-08-21T12:37:47", "directive": {"action": "DISPATCH_TO_ROLE", "artifact_id": "", "directive_id": "pmdir-20260821-1236-lane-a-123619", "notes": "", "request_id": "pmreq-88ee2f0a7ccdcb7ae379", "target_endpoint": "windows-worker", "work_item": "M0-LANE-A-123619"}, "event": "step", "round": 2, "state": "DIRECTIVE_ACCEPTED", "work_item": "M0-LANE-A-123619"}
+{"action": "PM_WOKEN", "at": "2026-08-21T12:37:47", "event": "step", "round": 2, "state": "AWAITING_PM_ROUTING", "work_item": "M0-LANE-B-123619"}
+{"at": "2026-08-21T12:38:24", "endpoint": "windows-worker", "event": "send", "ok": true, "reason": "ok", "total_sends": 3}
+{"action": "DISPATCHED", "at": "2026-08-21T12:38:37", "event": "step", "round": 3, "state": "AWAITING_WORKER", "work_item": "M0-LANE-A-123619"}
+{"action": "DIRECTIVE_ACCEPTED", "at": "2026-08-21T12:38:37", "directive": {"action": "DISPATCH_TO_ROLE", "artifact_id": "", "directive_id": "pmdir-20260821-1237-lane-b-123619", "notes": "", "request_id": "pmreq-18a09920906a8d77c3a4", "target_endpoint": "architecture-tl", "work_item": "M0-LANE-B-123619"}, "event": "step", "round": 3, "state": "DIRECTIVE_ACCEPTED", "work_item": "M0-LANE-B-123619"}
+{"at": "2026-08-21T12:39:24", "endpoint": "architecture-tl", "event": "send", "ok": true, "reason": "ok", "total_sends": 4}
+{"action": "WORKER_IDLE_TRY_COLLECT", "at": "2026-08-21T12:39:24", "event": "step", "observed": "idle", "round": 4, "state": "COLLECTING", "work_item": "M0-LANE-A-123619"}
+{"action": "DISPATCHED", "at": "2026-08-21T12:39:24", "event": "step", "round": 4, "state": "AWAITING_WORKER", "work_item": "M0-LANE-B-123619"}
+{"action": "COLLECTED", "at": "2026-08-21T12:39:57", "event": "step", "round": 5, "state": "REPORTING_TO_PM", "work_item": "M0-LANE-A-123619"}
+{"action": "WORKER_IDLE_TRY_COLLECT", "at": "2026-08-21T12:39:57", "event": "step", "observed": "idle", "round": 5, "state": "COLLECTING", "work_item": "M0-LANE-B-123619"}
+{"at": "2026-08-21T12:40:30", "endpoint": "orbit-pm", "event": "send", "ok": true, "reason": "ok", "total_sends": 5}
+{"action": "REPORTED_TO_PM", "at": "2026-08-21T12:40:44", "event": "step", "round": 6, "state": "COMPLETED", "work_item": "M0-LANE-A-123619"}
+{"action": "COLLECTED", "at": "2026-08-21T12:40:44", "event": "step", "round": 6, "state": "REPORTING_TO_PM", "work_item": "M0-LANE-B-123619"}
+{"at": "2026-08-21T12:41:17", "endpoint": "orbit-pm", "event": "send", "ok": true, "reason": "ok", "total_sends": 6}
+{"action": "IDLE", "at": "2026-08-21T12:41:17", "event": "step", "round": 7, "state": "COMPLETED", "work_item": "M0-LANE-A-123619"}
+{"action": "REPORTED_TO_PM", "at": "2026-08-21T12:41:17", "event": "step", "round": 7, "state": "COMPLETED", "work_item": "M0-LANE-B-123619"}
+{"at": "2026-08-21T12:41:19", "event": "all_lanes_terminal", "states": {"M0-LANE-A-123619": "COMPLETED", "M0-LANE-B-123619": "COMPLETED"}}
+{"at": "2026-08-21T12:41:21", "event": "final", "rounds": 7, "sends_by_endpoint": {"architecture-tl": 1, "orbit-pm": 4, "windows-worker": 1}, "states": {"M0-LANE-A-123619": "COMPLETED", "M0-LANE-B-123619": "COMPLETED"}, "total_sends": 6}
+{"at": "2026-08-21T12:41:21", "crossed": false, "event": "request_ids", "ids": {"M0-LANE-A-123619": "pmreq-88ee2f0a7ccdcb7ae379", "M0-LANE-B-123619": "pmreq-18a09920906a8d77c3a4"}}
+{"all_bound_to_work_item": true, "at": "2026-08-21T12:41:21", "event": "collected", "files": ["HANDOFF_M0-LANE-A-123619_WORKER_TO_ORBIT.md"], "work_item": "M0-LANE-A-123619"}
+{"all_bound_to_work_item": true, "at": "2026-08-21T12:41:21", "event": "collected", "files": ["HANDOFF_M0-LANE-B-123619_ARCHITECTURE_TO_ORBIT.md"], "work_item": "M0-LANE-B-123619"}
