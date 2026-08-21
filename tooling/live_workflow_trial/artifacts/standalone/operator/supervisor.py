@@ -73,6 +73,15 @@ TRANSIENT_BLOCKERS = frozenset({
     "focus-verification-failed",
     "composer-not-found",
     "composer-not-present",
+    # The project chat list is recency-ordered and renders a fixed number of
+    # entries, so a registered chat drops off it whenever other conversations
+    # are used -- including by Orbit itself. Refusing to send is right; treating
+    # it as permanent is not, because focusing the chat brings it back. Observed
+    # live: Orbit PM vanished from the list when a new chat took its slot.
+    #
+    # A chat that has genuinely been renamed or deleted still blocks, after the
+    # bounded number of attempts below.
+    "endpoint-not-observed",
 })
 
 # A lane that cannot get the window after this many consecutive cycles is not

@@ -70,6 +70,27 @@ class ContentionTests(unittest.TestCase):
         self.wake_returns("writer-busy")
         self.assertEqual(self.sup.step_lane(lane)["action"], "WAITING_FOR_TURN")
 
+    def test_SUP_CONT_002b_a_chat_scrolled_off_the_list_is_not_a_dead_lane(self):
+        """The list is recency-ordered and capped, so registered chats drop off.
+
+        Observed live: Orbit PM vanished from the project list when a new chat
+        took its slot, and every lane that needed it blocked permanently.
+        """
+        lane = self.lane()
+        self.wake_returns("endpoint-not-observed")
+        out = self.sup.step_lane(lane)
+        self.assertEqual(out["action"], "WAITING_FOR_TURN")
+        self.assertNotEqual(lane.record.work_state, STATE_BLOCKED)
+
+    def test_SUP_CONT_002c_a_permanently_missing_chat_still_blocks_eventually(self):
+        """Renamed or deleted is different from scrolled away."""
+        from standalone.operator.supervisor import MAX_CONSECUTIVE_TRANSIENT
+        lane = self.lane()
+        self.wake_returns("endpoint-not-observed")
+        for _ in range(MAX_CONSECUTIVE_TRANSIENT):
+            self.sup.step_lane(lane)
+        self.assertEqual(lane.record.work_state, STATE_BLOCKED)
+
     def test_SUP_CONT_003_a_real_failure_still_blocks_immediately(self):
         lane = self.lane()
         self.wake_returns("endpoint-not-registered")
