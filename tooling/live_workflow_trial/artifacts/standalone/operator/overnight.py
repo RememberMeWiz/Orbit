@@ -102,6 +102,17 @@ class OvernightRunner:
                 return ""
         return run("rev-parse", "--abbrev-ref", "HEAD"), run("rev-parse", "HEAD")
 
+    def _refresh_counts(self) -> None:
+        """Lane counts without stepping anything. Safe to call while idle."""
+        self.supervisor.refresh_lanes()
+        lanes = self.supervisor.list_lanes()
+        self._beat.lane_count = len(lanes)
+        self._beat.active_lane_count = sum(
+            1 for l in lanes if l.record.work_state not in
+            (STATE_COMPLETED, STATE_BLOCKED, STATE_STOPPED, STATE_HOLD))
+        self._beat.blocked_lane_count = sum(
+            1 for l in lanes if l.record.work_state == STATE_BLOCKED)
+
     def _record_cycle(self, cycle_results) -> None:
         lanes = self.supervisor.list_lanes()
         self._beat.lane_count = len(lanes)
@@ -178,7 +189,16 @@ class OvernightRunner:
                     clear_drain(self.supervisor.state_dir)
                     break
 
+                # Checked before incrementing, and before the yield and
+                # surface-wait paths that `continue` past the bottom of the
+                # loop: a bounded run with someone at the keyboard otherwise
+                # spins forever, and counting the aborted pass overstates by one.
+                if self.max_cycles is not None and cycle_count >= self.max_cycles:
+                    self.log_event("MAX_CYCLES_REACHED", {"cycles": cycle_count})
+                    break
+
                 cycle_count += 1
+
                 self._beat.last_cycle_started_at = utc_now_iso()
                 self._beat.write()
 
@@ -191,6 +211,11 @@ class OvernightRunner:
                 # app about itself is unnecessary if we are not going to act.
                 who = presence(self.idle_threshold)
                 if who.present:
+                    # Lane counts are refreshed even while standing down.
+                    # `orbit supervisor status` is what a person reads to decide
+                    # whether Orbit is stuck, and reporting zero lanes because
+                    # we skipped the cycle reads as "it lost all the work".
+                    self._refresh_counts()
                     self._beat.health = "YIELDING_TO_HUMAN"
                     self._beat.write()
                     self._set_title(f"idle - you are using the machine "
@@ -202,6 +227,7 @@ class OvernightRunner:
                 self._set_title("checking ChatGPT window")
                 surface = self.supervisor.check_surface(allow_launch=True)
                 if not surface.get("drivable", False):
+                    self._refresh_counts()
                     self._beat.health = "WAITING_FOR_SURFACE"
                     self._beat.write()
                     self._set_title(f"waiting for ChatGPT ({surface.get('reason_code', '')})")
@@ -226,10 +252,6 @@ class OvernightRunner:
                         self.log_event("LANE_TRANSITION", res)
 
                 self._record_cycle(cycle_results)
-
-                if self.max_cycles is not None and cycle_count >= self.max_cycles:
-                    self.log_event("MAX_CYCLES_REACHED", {"cycles": cycle_count})
-                    break
 
                 self._sleep(self.poll_interval)
         except KeyboardInterrupt:

@@ -29,7 +29,7 @@ class TestOvernightRunner(unittest.TestCase):
             runner = OvernightRunner(
                 self.supervisor,
                 poll_interval=0.01,
-                max_cycles=3,
+                idle_threshold=0.0, max_cycles=3,
                 sleeper=lambda s: None,
             )
 
@@ -56,7 +56,7 @@ class TestOvernightRunner(unittest.TestCase):
             runner = OvernightRunner(
                 self.supervisor,
                 poll_interval=0.01,
-                max_cycles=5,
+                idle_threshold=0.0, max_cycles=5,
                 sleeper=lambda s: None,
             )
 
