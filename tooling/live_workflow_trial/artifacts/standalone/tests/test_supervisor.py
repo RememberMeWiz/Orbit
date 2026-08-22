@@ -336,6 +336,89 @@ class AssignmentContractTests(unittest.TestCase):
             self.assertIsNotNone(NAME_RE.match(handoff_filename("M0-X-001", role)), role)
 
 
+class HumanPresenceTests(unittest.TestCase):
+    """Orbit yields the machine to whoever is sitting at it."""
+
+    def test_SUP_HUM_001_recent_input_means_a_human_is_present(self):
+        from standalone.operator import humanpresence
+        original = humanpresence.idle_seconds
+        try:
+            humanpresence.idle_seconds = lambda: 3.0
+            self.assertTrue(humanpresence.presence(45.0).present)
+            humanpresence.idle_seconds = lambda: 120.0
+            self.assertFalse(humanpresence.presence(45.0).present)
+        finally:
+            humanpresence.idle_seconds = original
+
+    def test_SUP_HUM_002_unmeasurable_idle_reads_as_absent(self):
+        """Orbit exists to work while nobody is watching.
+
+        Refusing to run where idle time cannot be read would disable it on that
+        host entirely, and the cost of being wrong here is an interruption.
+        """
+        from standalone.operator import humanpresence
+        original = humanpresence.idle_seconds
+        try:
+            humanpresence.idle_seconds = lambda: -1.0
+            who = humanpresence.presence(45.0)
+            self.assertFalse(who.present)
+            self.assertFalse(who.measurable)
+        finally:
+            humanpresence.idle_seconds = original
+
+
+class SharedWindowFailureTests(unittest.TestCase):
+    """Losing the window to another lane is contention, not a dead lane."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.adapter = MagicMock()
+        from standalone.operator.supervisor import MultiWorkItemSupervisor
+        self.sup = MultiWorkItemSupervisor(Path(self.tmp.name), adapter=self.adapter)
+        self.lane = self.sup.create_lane("W-1", "objective",
+                                         expect="HANDOFF_W-1_A_TO_B.md", token="TOK")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_SUP_SHARE_001_a_lost_focus_race_while_collecting_is_not_terminal(self):
+        """Observed live: a lane collecting from Product Research was killed
+        because another lane took the window between focus and verification."""
+        from standalone.bridge.contracts import ChatTransportResult
+        self.lane.record.work_state = STATE_COLLECTING
+        self.lane.record.current_endpoint = "product-research"
+        self.lane.save_record()
+        self.adapter.collect_from_transcript.return_value = ChatTransportResult.deny(
+            "COLLECT_EXPECTED_ARTIFACT", "focus-verification-failed",
+            "expected 'Product Research', header shows 'Architecture TL'")
+
+        out = self.sup.step_lane(self.lane)
+        self.assertEqual(out["action"], "WAITING_FOR_TURN")
+        self.assertNotEqual(self.lane.record.work_state, STATE_BLOCKED)
+
+    def test_SUP_SHARE_002_a_failed_report_does_not_discard_a_collected_result(self):
+        from standalone.bridge.contracts import ChatTransportResult
+        self.lane.record.work_state = STATE_REPORTING_TO_PM
+        self.lane.record.result_digest = "abc123"
+        self.lane.save_record()
+        self.adapter.deliver.return_value = ChatTransportResult.deny(
+            "SEND_BOUNDED_MESSAGE", "response-in-progress", "")
+
+        out = self.sup.step_lane(self.lane)
+        self.assertEqual(out["action"], "WAITING_FOR_TURN")
+        self.assertEqual(self.lane.record.work_state, STATE_REPORTING_TO_PM)
+        self.assertEqual(self.lane.record.result_digest, "abc123")
+
+    def test_SUP_SHARE_003_a_genuinely_impossible_dispatch_still_blocks(self):
+        """The classifier must not have made everything retryable."""
+        self.lane.record.work_state = STATE_DIRECTIVE_ACCEPTED
+        self.lane.record.accepted_action = "HOLD"
+        self.lane.save_record()
+        out = self.sup.step_lane(self.lane)
+        self.assertEqual(out["action"], "DISPATCH_REFUSED")
+        self.assertEqual(self.lane.record.work_state, STATE_BLOCKED)
+
+
 class ScopeSourceOfTruthTests(unittest.TestCase):
     """Scope must come from the committed config, never from a code default."""
 

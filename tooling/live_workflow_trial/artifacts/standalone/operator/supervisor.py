@@ -504,7 +504,8 @@ class MultiWorkItemSupervisor:
         if rec.work_state == STATE_AWAITING_WORKER:
             focused = self.adapter.focus(rec.current_endpoint)
             if not focused.ok:
-                return {"work_item": lane.work_item, "action": "WORKER_FOCUS_FAILED", "state": rec.work_state}
+                return self._note_failure(lane, focused.reason_code, focused.detail,
+                                          "WORKER_FOCUS_FAILED", STATE_AWAITING_WORKER)
 
             # Is the answer there yet? -- not -- did I witness it arriving?
             #
@@ -560,11 +561,13 @@ class MultiWorkItemSupervisor:
                 return {"work_item": lane.work_item, "action": "AWAITING_WORKER_RESPONSE",
                         "state": rec.work_state, "reason_code": out.reason_code}
             else:
-                rec.work_state = STATE_BLOCKED
-                rec.blocker_code = out.reason_code
-                rec.blocker_detail = out.detail
-                lane.save_record()
-                return {"work_item": lane.work_item, "action": "COLLECT_FAILED", "state": rec.work_state}
+                # Through the classifier, not straight to BLOCKED. Observed
+                # live: a lane collecting from Product Research was killed by
+                # `focus-verification-failed` because another lane had taken the
+                # window between the focus and the header check. That is the
+                # ordinary cost of sharing one window, not a dead lane.
+                return self._note_failure(lane, out.reason_code, out.detail,
+                                          "COLLECT_FAILED", STATE_AWAITING_WORKER)
 
         # 6. REPORTING_TO_PM -> Report to PM and complete
         if rec.work_state == STATE_REPORTING_TO_PM:
@@ -591,11 +594,10 @@ class MultiWorkItemSupervisor:
                 )
                 return {"work_item": lane.work_item, "action": "REPORTED_TO_PM", "state": rec.work_state}
             else:
-                rec.work_state = STATE_BLOCKED
-                rec.blocker_code = out.reason_code
-                rec.blocker_detail = out.detail
-                lane.save_record()
-                return {"work_item": lane.work_item, "action": "REPORT_FAILED", "state": rec.work_state}
+                # The result is already collected and validated; failing to
+                # reach PM this cycle must not discard it.
+                return self._note_failure(lane, out.reason_code, out.detail,
+                                          "REPORT_FAILED", STATE_REPORTING_TO_PM)
 
         return {"work_item": lane.work_item, "action": "NO_OP", "state": rec.work_state}
 

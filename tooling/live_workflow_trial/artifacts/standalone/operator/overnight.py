@@ -28,6 +28,7 @@ from typing import Any, Callable, Dict, Optional
 
 from .lane import STATE_BLOCKED, STATE_COMPLETED, STATE_HOLD, STATE_STOPPED
 from .supervisor import MultiWorkItemSupervisor
+from .humanpresence import DEFAULT_IDLE_SECONDS, presence
 from .supervisor_process import (Heartbeat, clear_drain, code_fingerprint,
                                  drain_requested, process_identity)
 
@@ -45,6 +46,7 @@ class OvernightRunner:
         *,
         poll_interval: float = 15.0,
         max_cycles: Optional[int] = None,
+        idle_threshold: float = DEFAULT_IDLE_SECONDS,
         sleeper: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.monotonic,
     ):
@@ -56,8 +58,23 @@ class OvernightRunner:
         self._running = False
         self._last_state_snapshot: Dict[str, str] = {}
 
+        self.idle_threshold = idle_threshold
         self.log_file = self.supervisor.state_dir / "overnight.log"
         self.events_file = self.supervisor.state_dir / "events.jsonl"
+
+    def _set_title(self, what: str) -> None:
+        """Say what Orbit is doing, in the console title.
+
+        The window is the thing a person actually glances at, and a title is
+        visible from the taskbar without switching to it. Costs nothing and
+        needs no notification dependency.
+        """
+        try:
+            if sys.platform == "win32":
+                import ctypes
+                ctypes.windll.kernel32.SetConsoleTitleW(f"Orbit — {what}")
+        except Exception:
+            pass
 
     def _new_heartbeat(self) -> Heartbeat:
         repo_root = Path(__file__).resolve().parents[2]
@@ -165,11 +182,29 @@ class OvernightRunner:
                 self._beat.last_cycle_started_at = utc_now_iso()
                 self._beat.write()
 
+                # Yield the machine to whoever is sitting at it.
+                #
+                # Orbit switches the visible conversation and writes into the
+                # composer, so running while someone is typing changes what is
+                # on screen under their hands and interleaves their input with
+                # Orbit's. Checked before the surface, because even asking the
+                # app about itself is unnecessary if we are not going to act.
+                who = presence(self.idle_threshold)
+                if who.present:
+                    self._beat.health = "YIELDING_TO_HUMAN"
+                    self._beat.write()
+                    self._set_title(f"idle - you are using the machine "
+                                    f"({who.idle_seconds:.0f}s since input)")
+                    self._sleep(min(self.poll_interval, 10.0))
+                    continue
+
                 # Re-checked every cycle, not only at startup.
+                self._set_title("checking ChatGPT window")
                 surface = self.supervisor.check_surface(allow_launch=True)
                 if not surface.get("drivable", False):
                     self._beat.health = "WAITING_FOR_SURFACE"
                     self._beat.write()
+                    self._set_title(f"waiting for ChatGPT ({surface.get('reason_code', '')})")
                     self.log_event("SURFACE_UNAVAILABLE_WAITING", surface, level="WARNING")
                     self._sleep(self.poll_interval)
                     continue
@@ -178,6 +213,7 @@ class OvernightRunner:
                 active_lanes = [l for l in lanes if not l.stopped() and not l.paused() and l.record.work_state not in (STATE_COMPLETED, STATE_BLOCKED, STATE_HOLD)]
 
                 # Execute one pass over all active lanes
+                self._set_title(f"working - cycle {cycle_count}")
                 cycle_results = self.supervisor.cycle_all()
 
                 # Check for state changes to log meaningfully
@@ -208,6 +244,7 @@ class OvernightRunner:
             }
         finally:
             self._running = False
+            self._set_title("stopped")
             self.log_event("OVERNIGHT_FINISHED", {"total_cycles": cycle_count})
 
         summary = self.supervisor.status_summary()
